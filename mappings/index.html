@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cloudflare e-mail forwarding manager</title>
+  <style>
+    :root {
+      --fg: #1f2328;
+      --muted: #57606a;
+      --bg: #ffffff;
+      --panel: #f6f8fa;
+      --border: #d0d7de;
+      --accent: #0969da;
+      --green: #1a7f37;
+      --red: #cf222e;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--fg);
+      background: var(--bg);
+      margin: 0;
+      padding: 24px;
+      max-width: 880px;
+      margin-inline: auto;
+    }
+    h1 { font-size: 1.4rem; margin: 0 0 4px; }
+    h2 { font-size: 1.05rem; margin: 0 0 12px; }
+    .sub { color: var(--muted); margin-bottom: 24px; }
+    section {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 18px;
+      margin-bottom: 16px;
+      background: var(--panel);
+    }
+    label { display: block; font-weight: 600; margin: 8px 0 4px; font-size: 0.92rem; }
+    input[type=text], input[type=email], select {
+      padding: 6px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: white;
+      font: inherit;
+      font-family: var(--mono);
+    }
+    input.bad { border-color: var(--red); }
+    button {
+      cursor: pointer;
+      padding: 6px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: white;
+      font: inherit;
+      font-weight: 500;
+    }
+    button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+    button.primary:disabled { background: #8c959f; border-color: #8c959f; cursor: not-allowed; }
+    button.danger { color: var(--red); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    [hidden] { display: none !important; }
+    .actions { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .muted { color: var(--muted); }
+    .mono { font-family: var(--mono); }
+    .error { color: var(--red); white-space: pre-wrap; }
+    .ok { color: var(--green); }
+    .status-area { min-height: 20px; margin-top: 12px; }
+    code { font-family: var(--mono); background: #eaeef2; padding: 1px 4px; border-radius: 4px; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: white; border: 1px solid var(--border);
+      border-radius: 999px; padding: 3px 6px 3px 12px;
+      font-family: var(--mono); font-size: 0.85rem;
+    }
+    .pill button {
+      border: none; background: transparent; padding: 0 4px;
+      color: var(--muted); font-weight: 700; line-height: 1;
+    }
+    .pill button:hover { color: var(--red); }
+    .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); }
+    td.dest { font-family: var(--mono); font-size: 0.85rem; }
+    .src { font-family: var(--mono); font-weight: 600; }
+    .right { text-align: right; white-space: nowrap; }
+    .grow { flex: 1 1 200px; min-width: 160px; }
+    .tabs {
+      display: flex; gap: 4px; flex-wrap: wrap;
+      border-bottom: 1px solid var(--border); margin: 0 0 18px;
+    }
+    .tab {
+      background: transparent; border: 1px solid transparent; border-bottom: none;
+      padding: 9px 16px; border-radius: 8px 8px 0 0; margin-bottom: -1px;
+      color: var(--muted); font-weight: 600; cursor: pointer;
+    }
+    .tab:hover { color: var(--fg); }
+    .tab.active {
+      background: var(--panel); border-color: var(--border); color: var(--fg);
+    }
+    .tab-panel section:first-child { margin-top: 0; }
+    dialog {
+      border: 1px solid var(--border); border-radius: 10px; padding: 0;
+      width: min(560px, 92vw);
+    }
+    dialog::backdrop { background: rgba(0,0,0,0.35); }
+    .dlg-body { padding: 18px 20px; }
+    .dlg-head { font-size: 1.1rem; font-weight: 700; margin-bottom: 12px; }
+    .dest-edit-row { display: flex; gap: 8px; margin-top: 6px; }
+    .dest-edit-row input { flex: 1; }
+    .src-edit { display: flex; gap: 8px; align-items: center; }
+    .src-edit input { flex: 1; }
+    .src-edit span { font-family: var(--mono); }
+    .badge {
+      display: inline-block; font-size: 0.78rem; padding: 2px 8px;
+      border-radius: 999px; font-weight: 600; white-space: nowrap;
+    }
+    .badge.ready, .badge.verified, .badge.deployed { background: #dafbe1; color: var(--green); }
+    .badge.pending, .badge.zone-no-email, .badge.outdated { background: #fff8c5; color: #9a6700; }
+    .badge.missing, .badge.no-zone, .badge.absent { background: #ffebe9; color: var(--red); }
+    .badge.unknown { background: #eaeef2; color: #57606a; }
+    .badge.badge-link { cursor: pointer; text-decoration: none; }
+    .badge.badge-link:hover { text-decoration: underline; }
+    .guide-status { list-style: none; padding-left: 0; }
+    .guide-status li { margin: 6px 0; }
+    .cf-block { background: white; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-top: 10px; }
+    .cf-block h3 { margin: 0 0 8px; font-size: 0.95rem; }
+    .cf-item { padding: 6px 0; border-bottom: 1px solid #eaeef2; }
+    .cf-item:last-child { border-bottom: none; }
+    .cf-instr { color: var(--muted); font-size: 0.86rem; margin-top: 4px; }
+    .reasons { color: var(--red); font-size: 0.84rem; }
+    .cf-banner {
+      margin-top: 12px; padding: 10px 12px; border-radius: 6px;
+      font-size: 0.9rem; border: 1px solid var(--border); background: white;
+    }
+    .cf-banner.warn { background: #fff8c5; border-color: #d4a72c; color: #6b5900; }
+    .cf-banner .row { justify-content: space-between; gap: 12px; }
+    .spinner {
+      display: inline-block; width: 13px; height: 13px;
+      border: 2px solid var(--border); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: -2px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    /* Deploy wizard */
+    #wiz { width: min(680px, 94vw); }
+    .wiz-head { padding: 16px 20px 0; }
+    .wiz-title { font-size: 1.15rem; font-weight: 700; }
+    .wiz-steps {
+      display: flex; gap: 6px; list-style: none; padding: 0;
+      margin: 12px 0 0; flex-wrap: wrap;
+    }
+    .wiz-steps li {
+      font-size: 0.78rem; color: var(--muted); padding: 4px 10px;
+      border-radius: 999px; background: #eaeef2;
+    }
+    .wiz-steps li.active { background: var(--accent); color: #fff; }
+    .wiz-steps li.done { background: #dafbe1; color: var(--green); }
+    .wiz-body { padding: 16px 20px; min-height: 150px; max-height: 60vh; overflow: auto; }
+    .wiz-body h3 { margin: 0 0 6px; font-size: 0.98rem; }
+    .wiz-body p { margin: 0 0 10px; }
+    .wiz-foot {
+      display: flex; gap: 8px; align-items: center;
+      padding: 12px 20px 18px; border-top: 1px solid var(--border);
+    }
+    .wiz-list { margin: 0 0 12px; padding: 0; list-style: none; }
+    .wiz-list li { padding: 5px 0; border-bottom: 1px solid #eaeef2; }
+    .wiz-list li:last-child { border-bottom: none; }
+  </style>
+</head>
+<body>
+  <h1>Cloudflare e-mail forwarding manager</h1>
+
+  <nav class="tabs" id="tabs">
+    <button type="button" class="tab active" data-tab="overview">Overview</button>
+    <button type="button" class="tab" data-tab="connection">Connection</button>
+    <button type="button" class="tab" data-tab="destinations">Destinations</button>
+    <button type="button" class="tab" data-tab="mappings">Mappings</button>
+    <button type="button" class="tab" data-tab="guide">User guide</button>
+  </nav>
+
+  <!-- ===================== OVERVIEW ===================== -->
+  <div id="tab-overview" class="tab-panel">
+    <section>
+      <h2>Overview</h2>
+      <p class="muted" style="margin-top:0">
+        Define which incoming address forwards to which destination(s). Source
+        addresses are limited to your configured domains. Everything is stored
+        in a local SQLite database (<code>data/mappings.db</code>) and persists
+        across sessions. Use the tabs above to connect Cloudflare, manage
+        verified destination addresses, and edit your mappings.
+      </p>
+      <div id="overview-status" class="cf-banner"></div>
+      <div class="actions">
+        <button id="btn-deploy-wizard" class="primary" disabled
+          title="Connect to Cloudflare first">Deploy to Cloudflare…</button>
+        <button id="btn-import-wizard">Import from CSV…</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- ===================== CONNECTION ===================== -->
+  <div id="tab-connection" class="tab-panel" hidden>
+    <section>
+      <h2>Cloudflare connection</h2>
+      <p class="muted" style="margin-top:0">
+        Connect your Cloudflare account so the app can read live status and
+        deploy your mappings. Your API token is stored <b>encrypted</b> in the
+        local database and never leaves your machine except in calls to
+        Cloudflare.
+      </p>
+
+      <div id="cf-connect">
+        <label for="cf-token">Cloudflare API token</label>
+        <div class="row">
+          <input id="cf-token" type="password" class="grow"
+            placeholder="paste token with Workers Scripts: Edit, Email Routing: Edit, Zone: Read"
+            autocomplete="off" />
+          <button id="btn-cf-save-token" class="primary">Save token</button>
+          <button id="btn-cf-forget" class="danger" hidden>Forget</button>
+        </div>
+        <div id="cf-account-wrap" class="row" style="margin-top:8px" hidden>
+          <label for="cf-account" style="margin:0">Account</label>
+          <select id="cf-account" class="grow"></select>
+          <button id="btn-cf-set-account">Use account</button>
+        </div>
+        <div id="cf-connect-status" class="status-area"></div>
+
+        <details style="margin-top:10px;">
+          <summary>How do I get a token?</summary>
+          <div class="cf-instr" style="margin-top:8px;">
+            <p style="margin-top:0;">
+              The token lets this app create the Email Routing rules and the
+              fan-out Worker for you. It is stored <b>encrypted</b> on your
+              machine and never leaves it except in calls to Cloudflare.
+            </p>
+            <ol style="padding-left:18px;">
+              <li>
+                Open the
+                <a href="https://dash.cloudflare.com/profile/api-tokens"
+                   target="_blank" rel="noopener">API Tokens page</a>
+                (Cloudflare dashboard → My Profile → API Tokens).
+              </li>
+              <li>Click <b>Create Token</b> → <b>Create Custom Token</b> (“Get started”).</li>
+              <li>Give it a name, e.g. <code>mappings-manager</code>.</li>
+              <li>
+                Add these <b>Permissions</b>:
+                <ul style="padding-left:18px;">
+                  <li><b>Account</b> → <b>Workers Scripts</b> → <b>Edit</b></li>
+                  <li><b>Account</b> → <b>Email Routing Addresses</b> → <b>Edit</b></li>
+                  <li><b>Zone</b> → <b>Email Routing Rules</b> → <b>Edit</b></li>
+                  <li><b>Zone</b> → <b>Zone</b> → <b>Read</b></li>
+                </ul>
+              </li>
+              <li>
+                Under <b>Account Resources</b> pick your account, and under
+                <b>Zone Resources</b> choose <i>All zones</i> (or the specific
+                domains you’ll manage).
+              </li>
+              <li>Click <b>Continue to summary</b> → <b>Create Token</b>.</li>
+              <li>Copy the token shown and paste it above, then <b>Save token</b>.</li>
+            </ol>
+            <p class="muted" style="margin-bottom:0;">
+              Cloudflare shows the token value only once — if you lose it, just
+              create another. You can revoke it any time from the same page.
+            </p>
+          </div>
+        </details>
+      </div>
+    </section>
+  </div>
+
+  <!-- ===================== DESTINATIONS ===================== -->
+  <div id="tab-destinations" class="tab-panel" hidden>
+    <section>
+      <h2>Destination addresses</h2>
+      <div id="dests-guard" class="cf-banner warn" hidden>
+        <div class="row">
+          <span>Not connected to Cloudflare — connect first to manage destination addresses.</span>
+          <button id="dests-go-connect">Go to Connection</button>
+        </div>
+      </div>
+      <div id="cf-dests-area">
+        <p class="muted" style="margin-top:0">
+          Cloudflare only forwards to <b>verified</b> addresses. Add an address
+          to send it a verification email, then click the link in that inbox.
+        </p>
+        <div class="row">
+          <input id="cf-dest-email" type="email" class="grow"
+            placeholder="new-destination@example.com" autocomplete="off" />
+          <button id="btn-cf-dest-add" class="primary">Send verification</button>
+          <button id="btn-cf-dests-refresh">Refresh</button>
+        </div>
+        <div id="cf-dests-list" style="margin-top:12px"></div>
+        <div id="cf-dests-status" class="status-area"></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ===================== MAPPINGS ===================== -->
+  <div id="tab-mappings" class="tab-panel" hidden>
+    <section id="sec-domains">
+      <h2>Domains</h2>
+      <p class="muted" style="margin-top:0">
+        The closed list of domains that source addresses may use.
+      </p>
+      <div id="domain-chips" class="chips"></div>
+      <div class="row">
+        <input id="in-domain" type="text" class="grow" placeholder="example.com" />
+        <button id="btn-add-domain" class="primary">Add domain</button>
+      </div>
+      <div id="domain-status" class="status-area"></div>
+    </section>
+
+    <section id="sec-mappings">
+      <h2>Mappings</h2>
+      <div id="mappings-cf-banner" class="cf-banner" hidden></div>
+      <table id="mappings-table" style="margin-top:12px;">
+        <thead>
+          <tr>
+            <th>Source address</th>
+            <th>Destinations</th>
+            <th>Cloudflare status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="mappings-body"></tbody>
+      </table>
+      <div id="mappings-status" class="status-area"></div>
+      <div class="actions">
+        <button id="btn-new-mapping" class="primary">+ New mapping</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- ===================== USER GUIDE ===================== -->
+  <div id="tab-guide" class="tab-panel" hidden>
+    <section>
+      <h2>User guide</h2>
+      <p class="muted" style="margin-top:0">
+        The Cloudflare e-mail forwarding manager handles multi-destination
+        email forwarding for your domains.
+        It keeps a local list of mappings (one source address &rarr; one or more
+        destinations) in a SQLite database and pushes them to Cloudflare Email
+        Routing on demand. Everything Cloudflare-related is read live, so the
+        status you see always reflects reality.
+      </p>
+
+      <h3>The typical workflow</h3>
+      <ol>
+        <li>
+          <strong>Connection</strong> — paste a Cloudflare API token and pick the
+          account/zone. The token needs Email Routing and Workers permissions.
+          Until you connect, mappings still save locally but show no Cloudflare
+          status.
+        </li>
+        <li>
+          <strong>Destinations</strong> — every address you forward <em>to</em>
+          must be verified by Cloudflare first. Add an address here (or click
+          <em>Send verification</em> next to one referenced by a mapping),
+          then click the link in the email Cloudflare sends. Verified addresses
+          show a green <span class="badge verified">verified</span> badge.
+        </li>
+        <li>
+          <strong>Mappings</strong> — add a source address (its domain must be one
+          of your configured domains) and one or more destinations. Use the
+          <code>+ New mapping</code> button below the list. A blank local part
+          creates a catch-all for that domain.
+        </li>
+        <li>
+          <strong>Deploy</strong> — from the Overview tab, run the
+          <em>Deploy to Cloudflare</em> wizard. It validates each mapping,
+          shows what will be created/updated, and only deploys mappings that are
+          ready. You can also import mappings in bulk from CSV.
+        </li>
+      </ol>
+
+      <h3>Reading the Cloudflare status column</h3>
+      <ul class="guide-status">
+        <li><span class="badge deployed">on Cloudflare</span> Live and matches your local mapping.</li>
+        <li><span class="badge outdated">needs update</span> Exists on Cloudflare but differs — redeploy to sync.</li>
+        <li><span class="badge absent">not deployed</span> Saved locally, not yet on Cloudflare.</li>
+        <li>
+          <span class="badge missing badge-link">Need verification</span>
+          A destination (or the domain) isn't verified/ready yet, so this
+          mapping can't deploy. Click the badge to jump to
+          <strong>Destinations</strong> and verify it.
+        </li>
+        <li><span class="badge unknown">unknown</span> Status not yet determined (still loading the plan).</li>
+        <li><span class="muted">&mdash;</span> Not connected to Cloudflare.</li>
+      </ul>
+
+      <h3>Good to know</h3>
+      <ul>
+        <li>Adding or editing a mapping triggers an automatic status refresh — no manual reload needed.</li>
+        <li>A new destination referenced by a mapping appears in the Destinations tab marked <span class="badge missing">not registered</span> until you send verification.</li>
+        <li>Data lives in <code>data/mappings.db</code> and survives restarts. Only the API token is kept in-memory for the session.</li>
+      </ul>
+    </section>
+  </div>
+
+  <dialog id="impwiz">
+    <div class="wiz">
+      <div class="wiz-head">
+        <div class="wiz-title">Import mappings from CSV</div>
+        <ol class="wiz-steps" id="impwiz-steps">
+          <li data-step="input">1 · Paste or upload</li>
+          <li data-step="done">2 · Done</li>
+        </ol>
+      </div>
+      <div class="wiz-body" id="impwiz-body"></div>
+      <div class="wiz-foot">
+        <button id="impwiz-cancel" type="button">Cancel</button>
+        <span style="flex:1"></span>
+        <button id="impwiz-back" type="button" hidden>Back</button>
+        <button id="impwiz-next" type="button" class="primary">Import</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="wiz">
+    <div class="wiz">
+      <div class="wiz-head">
+        <div class="wiz-title">Deploy to Cloudflare</div>
+        <ol class="wiz-steps" id="wiz-steps">
+          <li data-step="check">1 · Check</li>
+          <li data-step="validate">2 · Validate addresses</li>
+          <li data-step="deploy">3 · Deploy</li>
+          <li data-step="done">4 · Done</li>
+        </ol>
+      </div>
+      <div class="wiz-body" id="wiz-body"></div>
+      <div class="wiz-foot">
+        <button id="wiz-cancel" type="button">Cancel</button>
+        <span style="flex:1"></span>
+        <button id="wiz-back" type="button" hidden>Back</button>
+        <button id="wiz-next" type="button" class="primary">Next</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="dlg">
+    <form method="dialog" id="dlg-form">
+      <div class="dlg-body">
+        <div class="dlg-head" id="dlg-title">New mapping</div>
+
+        <label>Source address</label>
+        <div class="src-edit">
+          <input id="dlg-local" type="text" placeholder="alias" />
+          <span>@</span>
+          <select id="dlg-domain"></select>
+        </div>
+        <p class="muted" style="margin:4px 0 0; font-size:0.85rem;">
+          Tip: use <code>*</code> as the local part (e.g. <code>*@domain</code>)
+          to create a <b>catch-all</b> that forwards every address on that domain.
+        </p>
+
+        <label style="margin-top:14px;">Destinations</label>
+        <div id="dlg-dests"></div>
+        <button id="dlg-add-dest" type="button" style="margin-top:8px;">+ Add destination</button>
+
+        <div id="dlg-status" class="status-area"></div>
+
+        <div class="actions" style="margin-top:16px; justify-content:flex-end;">
+          <button id="dlg-cancel" type="button" value="cancel">Cancel</button>
+          <button id="dlg-save" type="submit" class="primary" value="save">Save</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+{
+  "name": "cloudflare-email-forwarding-manager",
+  "version": "1.0.0",
+  "description": "A local web app to manage Cloudflare Email Routing forwarding rules: map a source address to one or more verified destinations, store them in a local SQLite database, and deploy them to Cloudflare (including multi-destination fan-out) directly from the UI.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Ofer Shezaf",
+  "homepage": "https://github.com/oshezaf/cloudflare-email-forwarding-manager#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oshezaf/cloudflare-email-forwarding-manager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/oshezaf/cloudflare-email-forwarding-manager/issues"
+  },
+  "keywords": [
+    "cloudflare",
+    "email-routing",
+    "email-forwarding",
+    "fan-out",
+    "sqlite",
+    "self-hosted"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node --no-warnings scripts/serve-mappings.mjs",
+    "mappings": "node --no-warnings scripts/serve-mappings.mjs"
+  }
+}
