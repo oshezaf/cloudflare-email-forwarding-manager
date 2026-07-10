@@ -1,14 +1,13 @@
-// Cloudflare integration for the local mappings manager.
+// Cloudflare integration for the hosted Email Forwarding Manager (Worker + D1).
 //
-// Because this app has a Node backend, it calls the Cloudflare API directly
-// (server-to-server, so CORS does not apply) — no separate proxy Worker is
-// needed.
+// This is the async D1 / WebCrypto port of the local app's scripts/cloudflare.mjs.
+// The Worker calls the Cloudflare API directly (server-to-server, so CORS does
+// not apply) — no separate proxy is needed.
 //
-// The API token is stored ENCRYPTED at rest in the SQLite `settings` table
-// using AES-256-GCM. The 32-byte key lives in `data/.cf-keyfile` (gitignored,
-// 0600 where the OS allows). This protects the token if the .db file is copied
-// without the keyfile; it is not protection against an attacker who already
-// has full read access to the data/ directory.
+// The API token is stored ENCRYPTED at rest in the D1 `settings` table using
+// AES-256-GCM (WebCrypto). The 32-byte key is the Worker secret `ENC_KEY`
+// (base64), set via `wrangler secret put ENC_KEY`. This protects the token if
+// the D1 contents leak without the secret.
 //
 // Forwarding model:
 //   * 1 destination  -> a Cloudflare Email Routing *rule* with a `forward`
@@ -16,10 +15,6 @@
 //   * N destinations  -> a single fan-out *Worker* whose source embeds every
 //                       multi-destination mapping, plus a routing rule with a
 //                       `worker` action pointing at that Worker.
-
-import { randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, chmodSync } from "node:fs";
-import { join } from "node:path";
 
 const CF_BASE = "https://api.cloudflare.com/client/v4";
 const PER_PAGE = 50;
@@ -30,36 +25,51 @@ function apiError(status, message) {
   return Object.assign(new Error(message), { status });
 }
 
-// ---------- Encryption ----------
+// ---------- Encryption (WebCrypto AES-256-GCM) ----------
+//
+// On-disk layout is base64(iv(12) || ciphertext+tag). WebCrypto appends the
+// 16-byte GCM tag to the ciphertext, so we don't separate it the way node's
+// crypto does — the hosted D1 starts fresh, so self-consistency is enough.
 
-function loadKey(dataDir) {
-  const keyPath = join(dataDir, ".cf-keyfile");
-  if (existsSync(keyPath)) {
-    const buf = readFileSync(keyPath);
-    if (buf.length === 32) return buf;
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function bytesToBase64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+async function importKey(env) {
+  const raw = base64ToBytes(String(env.ENC_KEY || ""));
+  if (raw.length !== 32) {
+    throw apiError(500, "ENC_KEY is missing or not 32 bytes (base64). Set it with `wrangler secret put ENC_KEY`.");
   }
-  const key = randomBytes(32);
-  writeFileSync(keyPath, key);
-  try { chmodSync(keyPath, 0o600); } catch { /* best effort on Windows */ }
-  return key;
+  return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
 }
 
-function encrypt(key, plaintext) {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
-  const enc = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return Buffer.concat([iv, tag, enc]).toString("base64");
+async function encrypt(env, plaintext) {
+  const key = await importKey(env);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(
+    await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(plaintext)));
+  const out = new Uint8Array(iv.length + ct.length);
+  out.set(iv, 0);
+  out.set(ct, iv.length);
+  return bytesToBase64(out);
 }
 
-function decrypt(key, b64) {
-  const raw = Buffer.from(b64, "base64");
-  const iv = raw.subarray(0, 12);
-  const tag = raw.subarray(12, 28);
-  const enc = raw.subarray(28);
-  const decipher = createDecipheriv("aes-256-gcm", key, iv);
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(enc), decipher.final()]).toString("utf8");
+async function decrypt(env, b64) {
+  const key = await importKey(env);
+  const raw = base64ToBytes(b64);
+  const iv = raw.slice(0, 12);
+  const ct = raw.slice(12);
+  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+  return new TextDecoder().decode(pt);
 }
 
 // ---------- Worker source generation ----------
@@ -117,28 +127,28 @@ function catchAllDomain(source) {
 
 // ---------- Cloudflare integration factory ----------
 
-export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
-  const key = loadKey(dataDir);
+export function createCloudflare({ env, EMAIL_RE, DOMAIN_RE }) {
+  const db = env.DB;
 
-  // settings table is created by the caller's schema.
-  const getSetting = (k) =>
-    db.prepare("SELECT value FROM settings WHERE key = ?").get(k)?.value ?? null;
+  // settings table is created by the schema.
+  const getSetting = async (k) =>
+    (await db.prepare("SELECT value FROM settings WHERE key = ?").bind(k).first())?.value ?? null;
   const setSetting = (k, v) =>
     db.prepare(
       "INSERT INTO settings (key, value) VALUES (?, ?) " +
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-    ).run(k, v);
-  const delSetting = (k) => db.prepare("DELETE FROM settings WHERE key = ?").run(k);
+    ).bind(k, v).run();
+  const delSetting = (k) => db.prepare("DELETE FROM settings WHERE key = ?").bind(k).run();
 
-  function getToken() {
-    const enc = getSetting("cf_token_enc");
+  async function getToken() {
+    const enc = await getSetting("cf_token_enc");
     if (!enc) return null;
-    try { return decrypt(key, enc); }
+    try { return await decrypt(env, enc); }
     catch { return null; }
   }
 
   async function cf(path, init = {}) {
-    const token = getToken();
+    const token = await getToken();
     if (!token) throw apiError(400, "No Cloudflare token configured");
     return cfWithToken(token, path, init);
   }
@@ -181,28 +191,35 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
     return all;
   }
 
-  // ----- mappings from the local DB -----
+  // ----- mappings from D1 -----
 
-  function loadMappings() {
-    const rows = db.prepare(
+  async function loadMappings() {
+    const rows = (await db.prepare(
       `SELECT m.id, m.local_part AS localPart, d.name AS domain
          FROM mappings m JOIN domains d ON d.id = m.domain_id`
-    ).all();
-    const destStmt = db.prepare("SELECT email FROM destinations WHERE mapping_id = ?");
+    ).all()).results;
+    const destRows = (await db.prepare(
+      "SELECT mapping_id AS mappingId, email FROM destinations"
+    ).all()).results;
+    const byMapping = new Map();
+    for (const r of destRows) {
+      if (!byMapping.has(r.mappingId)) byMapping.set(r.mappingId, []);
+      byMapping.get(r.mappingId).push(String(r.email).toLowerCase());
+    }
     return rows.map((m) => ({
       id: m.id,
       domain: m.domain.toLowerCase(),
       source: `${m.localPart}@${m.domain}`.toLowerCase(),
-      destinations: destStmt.all(m.id).map((r) => r.email.toLowerCase()),
+      destinations: byMapping.get(m.id) || [],
     }));
   }
 
   // ----- public handlers -----
 
   async function status() {
-    const token = getToken();
-    const accountId = getSetting("cf_account_id");
-    const workerName = getSetting("cf_worker_name") || DEFAULT_WORKER;
+    const token = await getToken();
+    const accountId = await getSetting("cf_account_id");
+    const workerName = (await getSetting("cf_worker_name")) || DEFAULT_WORKER;
     if (!token) return { connected: false, workerName };
     let tokenStatus = null;
     let account = null;
@@ -228,41 +245,41 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
     if (v.result?.status !== "active") {
       throw apiError(400, `Token status is "${v.result?.status || "unknown"}" (expected active)`);
     }
-    setSetting("cf_token_enc", encrypt(key, token));
+    await setSetting("cf_token_enc", await encrypt(env, token));
     const accounts = await paginate(token, "/accounts");
     // Auto-select if exactly one account.
-    if (accounts.length === 1) setSetting("cf_account_id", accounts[0].id);
+    if (accounts.length === 1) await setSetting("cf_account_id", accounts[0].id);
     return {
       ok: true,
       accounts: accounts.map((a) => ({ id: a.id, name: a.name })),
-      accountId: getSetting("cf_account_id"),
+      accountId: await getSetting("cf_account_id"),
     };
   }
 
-  function clearToken() {
-    delSetting("cf_token_enc");
-    delSetting("cf_account_id");
+  async function clearToken() {
+    await delSetting("cf_token_enc");
+    await delSetting("cf_account_id");
     return { ok: true };
   }
 
   async function setAccount(accountId) {
     accountId = String(accountId || "").trim();
     if (!accountId) throw apiError(400, "accountId is required");
-    setSetting("cf_account_id", accountId);
+    await setSetting("cf_account_id", accountId);
     return { ok: true, accountId };
   }
 
-  function requireAccount() {
-    const id = getSetting("cf_account_id");
+  async function requireAccount() {
+    const id = await getSetting("cf_account_id");
     if (!id) throw apiError(400, "No Cloudflare account selected");
     return id;
   }
 
   // Fetch the shared context the plan/deploy both need.
   async function gatherContext() {
-    const token = getToken();
+    const token = await getToken();
     if (!token) throw apiError(400, "No Cloudflare token configured");
-    const accountId = requireAccount();
+    const accountId = await requireAccount();
 
     const [zones, addresses] = await Promise.all([
       paginate(token, `/zones?account.id=${encodeURIComponent(accountId)}`),
@@ -328,9 +345,9 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
   }
 
   async function plan() {
-    const { token, zoneByName, destByEmail } = await gatherContext();
-    const mappings = loadMappings();
-    const workerName = getSetting("cf_worker_name") || DEFAULT_WORKER;
+    const { token, accountId, zoneByName, destByEmail } = await gatherContext();
+    const mappings = await loadMappings();
+    const workerName = (await getSetting("cf_worker_name")) || DEFAULT_WORKER;
 
     // ----- domains -----
     const domainNames = [...new Set(mappings.map((m) => m.domain))];
@@ -491,7 +508,7 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
     }
 
     return {
-      account: requireAccount(),
+      account: accountId,
       domains,
       destinations,
       summary: {
@@ -529,40 +546,34 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
     const skipped = [];
     const addedDomains = [];
 
-    const findDomain = db.prepare("SELECT id FROM domains WHERE name = ? COLLATE NOCASE");
-    const insDomain = db.prepare("INSERT INTO domains (name) VALUES (?)");
-    const findMapping = db.prepare("SELECT id FROM mappings WHERE local_part = ? AND domain_id = ?");
-    const insMapping = db.prepare("INSERT INTO mappings (local_part, domain_id) VALUES (?, ?)");
-    const delDests = db.prepare("DELETE FROM destinations WHERE mapping_id = ?");
-    const insDest = db.prepare("INSERT INTO destinations (mapping_id, email) VALUES (?, ?)");
-
-    const tx = db.transaction(() => {
-      for (const o of targets) {
-        const dests = (o.destinations || []).filter((e) => EMAIL_RE.test(e));
-        if (dests.length === 0) {
-          skipped.push({ source: o.source, reason: "no valid forward destinations" });
-          continue;
-        }
-        const localPart = catchAllDomain(o.source) ? "*" : o.source.slice(0, o.source.lastIndexOf("@"));
-        // Ensure the (closed-list) domain exists; auto-add it since it's clearly
-        // live on Cloudflare, and surface that we did so.
-        let dom = findDomain.get(o.domain);
-        if (!dom) {
-          const info = insDomain.run(o.domain);
-          dom = { id: Number(info.lastInsertRowid) };
-          addedDomains.push(o.domain);
-        }
-        let map = findMapping.get(localPart, dom.id);
-        if (!map) {
-          const info = insMapping.run(localPart, dom.id);
-          map = { id: Number(info.lastInsertRowid) };
-        }
-        delDests.run(map.id);
-        for (const e of dests) insDest.run(map.id, e);
-        imported.push({ source: o.source, destinations: dests });
+    // D1 has no interactive transactions; do the (low-volume) work sequentially.
+    for (const o of targets) {
+      const dests = (o.destinations || []).filter((e) => EMAIL_RE.test(e));
+      if (dests.length === 0) {
+        skipped.push({ source: o.source, reason: "no valid forward destinations" });
+        continue;
       }
-    });
-    tx();
+      const localPart = catchAllDomain(o.source) ? "*" : o.source.slice(0, o.source.lastIndexOf("@"));
+      // Ensure the (closed-list) domain exists; auto-add it since it's clearly
+      // live on Cloudflare, and surface that we did so.
+      let dom = await db.prepare("SELECT id FROM domains WHERE name = ? COLLATE NOCASE").bind(o.domain).first();
+      if (!dom) {
+        const info = await db.prepare("INSERT INTO domains (name) VALUES (?)").bind(o.domain).run();
+        dom = { id: Number(info.meta.last_row_id) };
+        addedDomains.push(o.domain);
+      }
+      let map = await db.prepare("SELECT id FROM mappings WHERE local_part = ? AND domain_id = ?").bind(localPart, dom.id).first();
+      if (!map) {
+        const info = await db.prepare("INSERT INTO mappings (local_part, domain_id) VALUES (?, ?)").bind(localPart, dom.id).run();
+        map = { id: Number(info.meta.last_row_id) };
+      }
+      const stmts = [db.prepare("DELETE FROM destinations WHERE mapping_id = ?").bind(map.id)];
+      for (const e of dests) {
+        stmts.push(db.prepare("INSERT INTO destinations (mapping_id, email) VALUES (?, ?)").bind(map.id, e));
+      }
+      await db.batch(stmts);
+      imported.push({ source: o.source, destinations: dests });
+    }
 
     return {
       imported,
@@ -577,7 +588,7 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
 
   async function addMissingDestinations() {
     const { token, accountId, destByEmail } = await gatherContext();
-    const mappings = loadMappings();
+    const mappings = await loadMappings();
     const all = [...new Set(mappings.flatMap((m) => m.destinations))];
     const missing = all.filter((e) => !destByEmail.has(e));
     const added = [];
@@ -604,9 +615,9 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
   // verification state. `verified` from the API is a timestamp string (or null)
   // — truthy means verified.
   async function listDestinations() {
-    const token = getToken();
+    const token = await getToken();
     if (!token) throw apiError(400, "No Cloudflare token configured");
-    const accountId = requireAccount();
+    const accountId = await requireAccount();
     const rows = await paginate(token, `/accounts/${encodeURIComponent(accountId)}/email/routing/addresses`);
     const addresses = rows
       .map((a) => ({
@@ -635,9 +646,9 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
     email = String(email || "").trim().toLowerCase();
     if (!email) throw apiError(400, "Email is required");
     if (!EMAIL_RE.test(email)) throw apiError(400, `"${email}" is not a valid email address`);
-    const token = getToken();
+    const token = await getToken();
     if (!token) throw apiError(400, "No Cloudflare token configured");
-    const accountId = requireAccount();
+    const accountId = await requireAccount();
 
     // If it already exists, report its current state instead of erroring.
     const existing = await paginate(token, `/accounts/${encodeURIComponent(accountId)}/email/routing/addresses`);
@@ -673,9 +684,9 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
   async function removeDestination(email) {
     email = String(email || "").trim().toLowerCase();
     if (!email) throw apiError(400, "Email is required");
-    const token = getToken();
+    const token = await getToken();
     if (!token) throw apiError(400, "No Cloudflare token configured");
-    const accountId = requireAccount();
+    const accountId = await requireAccount();
 
     const existing = await paginate(token, `/accounts/${encodeURIComponent(accountId)}/email/routing/addresses`);
     const found = existing.find((a) => (a.email || "").toLowerCase() === email);
@@ -692,7 +703,7 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
   }
 
   async function enableRouting(zoneId) {
-    const token = getToken();
+    const token = await getToken();
     if (!token) throw apiError(400, "No Cloudflare token configured");
     if (!zoneId) throw apiError(400, "zoneId is required");
     await cfWithToken(token, `/zones/${zoneId}/email/routing/enable`, {
@@ -734,7 +745,7 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
     }
 
     // 1. Fan-out worker for multi-destination mappings (exact + catch-all).
-    const workerName = getSetting("cf_worker_name") || DEFAULT_WORKER;
+    const workerName = (await getSetting("cf_worker_name")) || DEFAULT_WORKER;
     const manyExact = ready.filter((m) => m.destinations.length > 1 && !catchAllDomain(m.source));
     const manyCatchAll = ready.filter((m) => m.destinations.length > 1 && catchAllDomain(m.source));
     if (manyExact.length > 0 || manyCatchAll.length > 0) {

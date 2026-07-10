@@ -1,0 +1,42 @@
+# Cloudflare-hosted version of the Email Forwarding Manager.
+#
+# This deploys the manager itself as a Worker, backed by a D1 database, with the
+# static UI in ../mappings served via Workers Static Assets. Authentication is
+# expected to be provided at the edge by Cloudflare Access (see README.md) — the
+# Worker contains no auth code of its own.
+#
+# Before first deploy:
+#   1. wrangler d1 create email-forwarding-manager   (copy the database_id below)
+#   2. wrangler d1 execute email-forwarding-manager --remote --file schema.sql
+#   3. wrangler secret put ENC_KEY                     (base64 of 32 random bytes)
+#   4. set the custom-domain pattern below to your own hostname
+#   5. wrangler deploy
+
+name = "email-forwarding-manager"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# Custom domain. The zone (here example.com) must already be in your Cloudflare
+# account; wrangler then provisions the DNS record and TLS cert automatically.
+# Use a dedicated subdomain — this is an HTTPS binding only and does NOT touch
+# the domain's MX / Email Routing config, so it won't affect mail delivery.
+# Put Cloudflare Access in front of this hostname (see README) before use.
+[[routes]]
+pattern = "mail-admin.example.com"
+custom_domain = true
+
+# Static UI. The frontend in ../mappings is plain static HTML/JS that talks to
+# this Worker's /api/* routes, so it is reused verbatim. Assets are matched
+# first; anything under /api/* falls through to the Worker.
+[assets]
+directory = "../mappings"
+
+# D1 database holding domains / mappings / destinations / settings.
+# Replace database_id with the id printed by `wrangler d1 create`.
+[[d1_databases]]
+binding = "DB"
+database_name = "email-forwarding-manager"
+database_id = "REPLACE_WITH_DATABASE_ID"
+
+# ENC_KEY (the AES-GCM key that encrypts the stored Cloudflare API token) is a
+# secret, set with `wrangler secret put ENC_KEY`, not committed here.

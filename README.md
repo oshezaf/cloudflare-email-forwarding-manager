@@ -11,9 +11,9 @@ verified destination. This app removes that limit: when a mapping has several
 destinations it generates and deploys a tiny **fan-out Worker** that forwards a
 copy to each one, and wires the routing rule to it for you.
 
-> Status: this is the **locally deployable** version. A hosted version
-> (Cloudflare Pages/Workers behind Cloudflare Access) is planned — see
-> [Hosting it online](#hosting-it-online).
+> Two ways to run it: this **locally deployable** Node app (below), or the
+> **Cloudflare-hosted Worker** version in [`worker/`](worker/) (Workers + D1
+> behind Cloudflare Access). See [Hosting it online](#hosting-it-online).
 
 ---
 
@@ -170,14 +170,17 @@ machine.
 
 ## Hosting it online
 
-This release is meant to run on your own machine. Because it controls email
-forwarding **and** holds a Cloudflare API token, any networked deployment must
-sit behind authentication. The planned path is **Cloudflare Pages/Workers +
-[Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)**,
-which provides Google/identity federation without writing any auth code. Note
-that the current Node + on-disk-SQLite server cannot run on Workers as-is; a
-hosted version needs either a small VM behind a Cloudflare Tunnel or a port of
-the storage layer to D1/KV. See [`docs/DESIGN.md`](docs/DESIGN.md) for details.
+The Node app above is meant to run on your own machine. Because it controls
+email forwarding **and** holds a Cloudflare API token, any networked deployment
+must sit behind authentication.
+
+For an always-on, no-machine-required option, use the **Cloudflare-hosted
+Worker** version in [`worker/`](worker/). It runs the same UI and API as a
+Cloudflare Worker backed by **D1** (instead of on-disk SQLite), behind
+**[Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/)**
+for Google/identity federation — so authentication is enforced at the edge with
+no auth code in the app. Full setup is in [`worker/README.md`](worker/README.md).
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture.
 
 ---
 

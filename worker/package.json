@@ -1,0 +1,16 @@
+{
+  "name": "email-forwarding-manager-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare-hosted version of the Email Forwarding Manager (Worker + D1 + Static Assets).",
+  "license": "MIT",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute email-forwarding-manager --remote --file schema.sql",
+    "db:init:local": "wrangler d1 execute email-forwarding-manager --local --file schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
