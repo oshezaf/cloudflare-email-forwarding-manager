@@ -2,3 +2,4 @@ node_modules/
 .wrangler/
 *.log
 .dev.vars
+.cf-token
