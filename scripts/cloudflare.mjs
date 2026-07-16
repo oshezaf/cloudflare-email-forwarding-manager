@@ -4,9 +4,9 @@
 // (server-to-server, so CORS does not apply) — no separate proxy Worker is
 // needed.
 //
-// The API token is stored ENCRYPTED at rest in the SQLite `settings` table
-// using AES-256-GCM. The 32-byte key lives in `data/.cf-keyfile` (gitignored,
-// 0600 where the OS allows). This protects the token if the .db file is copied
+// The API token is stored ENCRYPTED at rest in `data/settings.json` using
+// AES-256-GCM. The 32-byte key lives in `data/.cf-keyfile` (gitignored, 0600
+// where the OS allows). This protects the token if settings.json is copied
 // without the keyfile; it is not protection against an attacker who already
 // has full read access to the data/ directory.
 //
@@ -130,18 +130,26 @@ function catchAllDomain(source) {
 
 // ---------- Cloudflare integration factory ----------
 
-export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
+export function createCloudflare({ dataDir, loadMappings, upsertMapping, EMAIL_RE, DOMAIN_RE }) {
   const key = loadKey(dataDir);
 
-  // settings table is created by the caller's schema.
-  const getSetting = (k) =>
-    db.prepare("SELECT value FROM settings WHERE key = ?").get(k)?.value ?? null;
-  const setSetting = (k, v) =>
-    db.prepare(
-      "INSERT INTO settings (key, value) VALUES (?, ?) " +
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-    ).run(k, v);
-  const delSetting = (k) => db.prepare("DELETE FROM settings WHERE key = ?").run(k);
+  // Small persisted settings store (encrypted token, selected account, worker
+  // name) kept in data/settings.json — the only state that survives restarts.
+  // Mappings are NOT persisted here: they live in memory and are reconstructed
+  // from Cloudflare (see reconstructMappings).
+  const SETTINGS_PATH = join(dataDir, "settings.json");
+  function readSettings() {
+    try { return JSON.parse(readFileSync(SETTINGS_PATH, "utf8")); }
+    catch { return {}; }
+  }
+  function writeSettings(obj) {
+    writeFileSync(SETTINGS_PATH, JSON.stringify(obj, null, 2));
+    try { chmodSync(SETTINGS_PATH, 0o600); } catch { /* best effort on Windows */ }
+  }
+  let settings = readSettings();
+  const getSetting = (k) => (k in settings ? settings[k] : null);
+  const setSetting = (k, v) => { settings[k] = v; writeSettings(settings); };
+  const delSetting = (k) => { delete settings[k]; writeSettings(settings); };
 
   function getToken() {
     const enc = getSetting("cf_token_enc");
@@ -194,16 +202,17 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
     return all;
   }
 
-  // ----- mappings from the local DB -----
+  // ----- reconstructing mappings from Cloudflare -----
 
   // Read the base64 JSON manifest embedded in the deployed fan-out Worker's
   // source, so multi-destination mappings (which the rules API cannot read
-  // back) can be reconstructed from Cloudflare. The worker content endpoint
-  // returns raw JS (not JSON), so we fetch text and substring-scan for the
-  // markers. Returns { exact, catchAll } or null when unavailable/unreadable.
+  // back) can be reconstructed from Cloudflare. The content/v2 endpoint returns
+  // the module as multipart/form-data (not JSON) — the /content path only
+  // accepts PUT (upload) — so we fetch text and substring-scan for the markers.
+  // Returns { exact, catchAll } or null when unavailable/unreadable.
   async function readWorkerManifest(token, accountId, name) {
     const path = `/accounts/${encodeURIComponent(accountId)}/workers/scripts/` +
-      `${encodeURIComponent(name)}/content`;
+      `${encodeURIComponent(name)}/content/v2`;
     let res;
     try {
       res = await fetch(CF_BASE + path, { headers: { Authorization: `Bearer ${token}` } });
@@ -223,20 +232,6 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
     } catch {
       return null;
     }
-  }
-
-  function loadMappings() {
-    const rows = db.prepare(
-      `SELECT m.id, m.local_part AS localPart, d.name AS domain
-         FROM mappings m JOIN domains d ON d.id = m.domain_id`
-    ).all();
-    const destStmt = db.prepare("SELECT email FROM destinations WHERE mapping_id = ?");
-    return rows.map((m) => ({
-      id: m.id,
-      domain: m.domain.toLowerCase(),
-      source: `${m.localPart}@${m.domain}`.toLowerCase(),
-      destinations: destStmt.all(m.id).map((r) => r.email.toLowerCase()),
-    }));
   }
 
   // ----- public handlers -----
@@ -352,6 +347,13 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
     return av.length === ev.length && av.every((x, i) => x === ev[i]);
   }
 
+  // Order-insensitive, case-insensitive comparison of two destination lists.
+  function sameDests(a, b) {
+    const norm = (v) => (v || []).map((x) => String(x).toLowerCase()).sort();
+    const av = norm(a), bv = norm(b);
+    return av.length === bv.length && av.every((x, i) => x === bv[i]);
+  }
+
   // The action the deployer would set for a mapping.
   function expectedAction(m, workerName) {
     return m.destinations.length > 1
@@ -382,7 +384,7 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
     const domains = [];
     const domainStatus = new Map();
     // For ready zones, cache the live rule list + catch-all so we can compute
-    // per-mapping deploy state and detect rules that aren't in our DB.
+    // per-mapping deploy state and detect rules that aren't in our staged list.
     const zoneRules = new Map(); // domain -> { zoneId, rules:[], catchAll:obj|null }
     for (const name of domainNames) {
       const zone = zoneByName.get(name);
@@ -436,22 +438,42 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
     const destStatus = new Map(destinations.map((d) => [d.email, d.status]));
 
     // Compute deploy state for one mapping against the live zone rules.
-    // "deployed"  – a matching rule exists with the action we'd set.
-    // "outdated"  – a rule exists but its action differs (wrong dests / type).
+    // "deployed"  – a matching rule exists with the action we'd set (and, for
+    //               worker mappings, the same destinations per the manifest).
+    // "outdated"  – a rule exists but differs, or a worker mapping's destinations
+    //               can't be confirmed to match the deployed Worker.
     // "absent"    – no matching rule exists yet.
     // "unknown"   – we couldn't read the zone's rules (permission / not ready).
     function deployStateFor(m) {
       const zr = zoneRules.get(m.domain);
       if (!zr) return "unknown";
       const expected = expectedAction(m, workerName);
+      const isWorker = m.destinations.length > 1;
+
+      // Locate the live action for this source.
+      let action;
       if (catchAllDomain(m.source)) {
-        const action = zr.catchAll?.actions?.[0];
+        action = zr.catchAll?.actions?.[0];
         if (!action || action.type === "drop") return "absent";
-        return sameAction(action, expected) ? "deployed" : "outdated";
+      } else {
+        const rule = findRule(zr.rules, m.source);
+        if (!rule) return "absent";
+        action = rule.actions?.[0];
       }
-      const rule = findRule(zr.rules, m.source);
-      if (!rule) return "absent";
-      return sameAction(rule.actions?.[0], expected) ? "deployed" : "outdated";
+
+      // Single-destination (forward) rules carry the address directly, so an
+      // action comparison is authoritative.
+      if (!isWorker) return sameAction(action, expected) ? "deployed" : "outdated";
+
+      // Multi-destination (worker) rules only name the fan-out Worker; the
+      // recipients live inside it. Confirm the rule points at our Worker, then
+      // compare the actual destinations via the Worker's embedded manifest.
+      if (!sameAction(action, expected)) return "outdated";
+      const live = catchAllDomain(m.source)
+        ? manifest?.catchAll?.[m.domain]
+        : manifest?.exact?.[m.source];
+      if (!live || !live.length) return "outdated"; // manifest unreadable / missing — can't confirm
+      return sameDests(live, m.destinations) ? "deployed" : "outdated";
     }
 
     // ----- per-mapping readiness -----
@@ -571,10 +593,10 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
     };
   }
 
-  // Import Cloudflare forward rules that aren't yet in the DB. `sources` is an
-  // optional whitelist of source addresses to import; when omitted, every
-  // importable orphan from the current plan is imported. Worker-backed and
-  // unreadable rules are never imported (they're report-only).
+  // Import Cloudflare forward rules that aren't yet in the in-memory store.
+  // `sources` is an optional whitelist of source addresses to import; when
+  // omitted, every importable orphan from the current plan is imported.
+  // Worker-backed and unreadable rules are never imported (report-only).
   async function importOrphans(sources) {
     const p = await plan();
     const importable = p.orphans?.importable || [];
@@ -587,50 +609,22 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
 
     const imported = [];
     const skipped = [];
-    const addedDomains = [];
-
-    const findDomain = db.prepare("SELECT id FROM domains WHERE name = ? COLLATE NOCASE");
-    const insDomain = db.prepare("INSERT INTO domains (name) VALUES (?)");
-    const findMapping = db.prepare("SELECT id FROM mappings WHERE local_part = ? AND domain_id = ?");
-    const insMapping = db.prepare("INSERT INTO mappings (local_part, domain_id) VALUES (?, ?)");
-    const delDests = db.prepare("DELETE FROM destinations WHERE mapping_id = ?");
-    const insDest = db.prepare("INSERT INTO destinations (mapping_id, email) VALUES (?, ?)");
-
-    const tx = db.transaction(() => {
-      for (const o of targets) {
-        const dests = (o.destinations || []).filter((e) => EMAIL_RE.test(e));
-        if (dests.length === 0) {
-          skipped.push({ source: o.source, reason: "no valid forward destinations" });
-          continue;
-        }
-        const localPart = catchAllDomain(o.source) ? "*" : o.source.slice(0, o.source.lastIndexOf("@"));
-        // Ensure the (closed-list) domain exists; auto-add it since it's clearly
-        // live on Cloudflare, and surface that we did so.
-        let dom = findDomain.get(o.domain);
-        if (!dom) {
-          const info = insDomain.run(o.domain);
-          dom = { id: Number(info.lastInsertRowid) };
-          addedDomains.push(o.domain);
-        }
-        let map = findMapping.get(localPart, dom.id);
-        if (!map) {
-          const info = insMapping.run(localPart, dom.id);
-          map = { id: Number(info.lastInsertRowid) };
-        }
-        delDests.run(map.id);
-        for (const e of dests) insDest.run(map.id, e);
-        imported.push({ source: o.source, destinations: dests });
+    for (const o of targets) {
+      const dests = (o.destinations || []).filter((e) => EMAIL_RE.test(e));
+      if (dests.length === 0) {
+        skipped.push({ source: o.source, reason: "no valid forward destinations" });
+        continue;
       }
-    });
-    tx();
+      upsertMapping(o.source, dests);
+      imported.push({ source: o.source, destinations: dests });
+    }
 
     return {
       imported,
       skipped,
-      addedDomains,
+      addedDomains: [],
       note: imported.length
-        ? `Imported ${imported.length} mapping(s) from Cloudflare` +
-          (addedDomains.length ? ` (added domain(s): ${addedDomains.join(", ")})` : "") + "."
+        ? `Imported ${imported.length} mapping(s) from Cloudflare.`
         : "Nothing to import.",
     };
   }
@@ -725,6 +719,40 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
       alreadyExisted: false,
       verified: false,
       note: "Cloudflare sent a verification email. Click the link in that inbox, then refresh.",
+    };
+  }
+
+  // Bulk-add destination addresses for verification WITHOUT touching mappings.
+  // Accepts a string (emails extracted by regex) or an array of emails. New
+  // addresses each get a Cloudflare verification email; existing ones are just
+  // reported (verified / pending).
+  async function addDestinations(input) {
+    const token = getToken();
+    if (!token) throw apiError(400, "No Cloudflare token configured");
+    const accountId = requireAccount();
+    const raw = typeof input === "string"
+      ? (input.match(/[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g) || [])
+      : (Array.isArray(input) ? input : []);
+    const emails = [...new Set(raw.map((e) => String(e).trim().toLowerCase()).filter(Boolean))];
+    const existing = await paginate(token, `/accounts/${encodeURIComponent(accountId)}/email/routing/addresses`);
+    const byEmail = new Map(existing.map((a) => [(a.email || "").toLowerCase(), a]));
+    const added = [], alreadyVerified = [], alreadyPending = [], invalid = [], failed = [];
+    for (const email of emails) {
+      if (!EMAIL_RE.test(email)) { invalid.push(email); continue; }
+      const found = byEmail.get(email);
+      if (found) { (found.verified ? alreadyVerified : alreadyPending).push(email); continue; }
+      try {
+        await cfWithToken(token, `/accounts/${encodeURIComponent(accountId)}/email/routing/addresses`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }),
+        });
+        added.push(email);
+      } catch (e) { failed.push({ email, error: e.message }); }
+    }
+    return {
+      total: emails.length, added, alreadyVerified, alreadyPending, invalid, failed,
+      note: added.length
+        ? `Sent verification to ${added.length} new address(es) — recipients must click the link Cloudflare emails them.`
+        : "No new addresses to add for verification.",
     };
   }
 
@@ -878,5 +906,82 @@ export function createCloudflare({ db, dataDir, EMAIL_RE, DOMAIN_RE }) {
     return result;
   }
 
-  return { status, setToken, clearToken, setAccount, plan, importOrphans, addMissingDestinations, listDestinations, addDestination, removeDestination, enableRouting, deploy };
+  // Reconstruct every mapping currently live on Cloudflare across all
+  // email-enabled zones in the account: single-destination forward rules
+  // directly, and multi-destination (worker) rules and catch-alls via the
+  // fan-out Worker's embedded manifest. Used to seed the in-memory store so
+  // Cloudflare stays the source of truth.
+  async function reconstructMappings() {
+    const { token, accountId, zoneByName } = await gatherContext();
+    const workerName = getSetting("cf_worker_name") || DEFAULT_WORKER;
+    const manifest = await readWorkerManifest(token, accountId, workerName);
+    const out = [];
+    for (const [name, zone] of zoneByName) {
+      const er = await getEmailRouting(token, zone.id);
+      if (!er.enabled) continue;
+      let rules = [];
+      try { rules = await paginate(token, `/zones/${zone.id}/email/routing/rules`); }
+      catch { continue; }
+      for (const rule of rules) {
+        if (rule.enabled === false) continue;
+        const ms = rule.matchers || [];
+        if (ms.length === 1 && ms[0].type === "all") continue; // catch-all handled below
+        const src = ruleSource(rule);
+        if (!src) continue;
+        const action = rule.actions?.[0];
+        let dests = null;
+        if (action?.type === "forward") {
+          dests = (action.value || []).map((x) => String(x).toLowerCase());
+        } else if (action?.type === "worker") {
+          const d = manifest?.exact?.[src];
+          if (d && d.length) dests = d.map((x) => String(x).toLowerCase());
+        }
+        if (dests && dests.length) {
+          const at = src.lastIndexOf("@");
+          out.push({ localPart: src.slice(0, at), domain: src.slice(at + 1),
+            source: src, destinations: dests });
+        }
+      }
+      let catchAll = null;
+      try {
+        const ca = await cfWithToken(token, `/zones/${zone.id}/email/routing/rules/catch_all`);
+        catchAll = ca.result || null;
+      } catch { /* unreadable — skip */ }
+      const caAction = catchAll?.actions?.[0];
+      if (caAction && caAction.type !== "drop") {
+        let dests = null;
+        if (caAction.type === "forward") {
+          dests = (caAction.value || []).map((x) => String(x).toLowerCase());
+        } else if (caAction.type === "worker") {
+          const d = manifest?.catchAll?.[name];
+          if (d && d.length) dests = d.map((x) => String(x).toLowerCase());
+        }
+        if (dests && dests.length) {
+          out.push({ localPart: "*", domain: name, source: `*@${name}`, destinations: dests });
+        }
+      }
+    }
+    return out;
+  }
+
+  // List every zone in the account (name + id) for the mapping editor's domain
+  // picker. Cheap: a single zones call, no per-zone routing probe.
+  async function listZones() {
+    const token = getToken();
+    if (!token) throw apiError(400, "No Cloudflare token configured");
+    const accountId = requireAccount();
+    const zones = await paginate(token, `/zones?account.id=${encodeURIComponent(accountId)}`);
+    const out = zones
+      .map((z) => ({ name: String(z.name || "").toLowerCase(), zoneId: z.id }))
+      .filter((z) => z.name)
+      .sort((a, b) => a.name.localeCompare(b.name));
+    return { zones: out };
+  }
+
+  // Cheap local check (no network) for whether we have enough to talk to CF.
+  function hasCredentials() {
+    return !!(getToken() && getSetting("cf_account_id"));
+  }
+
+  return { status, setToken, clearToken, setAccount, plan, importOrphans, addMissingDestinations, listDestinations, addDestination, addDestinations, removeDestination, enableRouting, deploy, reconstructMappings, listZones, hasCredentials };
 }

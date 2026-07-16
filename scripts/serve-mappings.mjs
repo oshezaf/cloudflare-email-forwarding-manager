@@ -1,14 +1,16 @@
-// Local mappings manager: a zero-dependency Node server that persists email
-// forwarding mappings in a SQLite database and serves the static UI from
-// mappings/. Source addresses are constrained to a closed list of domains.
+// Local mappings manager: a zero-dependency Node server that serves the static
+// UI from mappings/ and edits Cloudflare Email Routing. Mappings are NOT stored
+// locally — Cloudflare is the source of truth. They are held in memory for the
+// session (seeded from Cloudflare) and staged there until the user runs Deploy.
+// Only the encrypted token + selected account persist, in data/settings.json.
 //
 // REST API (all JSON):
-//   GET    /api/state           -> { domains, mappings }
-//   POST   /api/domains         { name }            -> domain
-//   DELETE /api/domains/:id
-//   POST   /api/mappings        { localPart, domainId, destinations[] } -> mapping
-//   PUT    /api/mappings/:id    { localPart, domainId, destinations[] } -> mapping
+//   GET    /api/state           -> { mappings }
+//   POST   /api/mappings        { localPart, domain, destinations[] } -> { id }
+//   PUT    /api/mappings/:id     { localPart, domain, destinations[] } -> { id }
 //   DELETE /api/mappings/:id
+//   POST   /api/import          { csv }
+//   /api/cloudflare/*           connection, zones, destinations, plan, deploy
 //
 // Everything else is served as a static file from mappings/.
 
@@ -17,69 +19,120 @@ import { readFile, stat, mkdir } from "node:fs/promises";
 import { extname, join, normalize, resolve, sep, dirname } from "node:path";
 import { exec } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { DatabaseSync } from "node:sqlite";
 import { createCloudflare } from "./cloudflare.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, "../mappings/");
 const DATA_DIR = resolve(__dirname, "../data/");
-const DB_PATH = join(DATA_DIR, "mappings.db");
 const PORT = Number(process.env.PORT) || 4748;
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const LOCAL_RE = /^[^\s@]+$/;
 const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
 
-// ---------- Database ----------
-
 await mkdir(DATA_DIR, { recursive: true });
-const db = new DatabaseSync(DB_PATH);
-db.exec(`
-  PRAGMA foreign_keys = ON;
-  CREATE TABLE IF NOT EXISTS domains (
-    id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE COLLATE NOCASE
-  );
-  CREATE TABLE IF NOT EXISTS mappings (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    local_part TEXT NOT NULL,
-    domain_id  INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE (local_part, domain_id)
-  );
-  CREATE TABLE IF NOT EXISTS destinations (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    mapping_id INTEGER NOT NULL REFERENCES mappings(id) ON DELETE CASCADE,
-    email      TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-  );
-`);
 
-const cloudflare = createCloudflare({ db, dataDir: DATA_DIR, EMAIL_RE, DOMAIN_RE });
+// ---------- In-memory mapping store ----------
+// Mappings are not persisted locally. They live only for the lifetime of the
+// server process and are seeded from Cloudflare (the source of truth) on first
+// access. Edits stage here until the user runs Deploy, which pushes them to
+// Cloudflare. On restart the store is empty and re-seeded from Cloudflare.
 
-function getState() {
-  const domains = db
-    .prepare("SELECT id, name FROM domains ORDER BY name COLLATE NOCASE")
-    .all();
-  const mappings = db
-    .prepare(
-      `SELECT m.id, m.local_part AS localPart, m.domain_id AS domainId,
-              d.name AS domain, m.created_at AS createdAt
-         FROM mappings m JOIN domains d ON d.id = m.domain_id
-         ORDER BY d.name COLLATE NOCASE, m.local_part COLLATE NOCASE`
-    )
-    .all();
-  const destStmt = db.prepare(
-    "SELECT email FROM destinations WHERE mapping_id = ? ORDER BY email COLLATE NOCASE"
-  );
-  for (const m of mappings) {
-    m.destinations = destStmt.all(m.id).map((r) => r.email);
-    m.source = `${m.localPart}@${m.domain}`;
+const store = { seeded: false, mappings: [], nextId: 1 };
+
+function publicMapping(m) {
+  return {
+    id: m.id,
+    localPart: m.localPart,
+    domain: m.domain,
+    source: `${m.localPart}@${m.domain}`,
+    destinations: [...m.destinations],
+  };
+}
+
+// Mappings in the normalized shape cloudflare.mjs expects.
+function loadMappings() {
+  return store.mappings.map((m) => ({
+    id: m.id,
+    domain: m.domain.toLowerCase(),
+    source: `${m.localPart}@${m.domain}`.toLowerCase(),
+    destinations: m.destinations.map((e) => e.toLowerCase()),
+  }));
+}
+
+// Insert or replace a mapping by (localPart, domain). Returns { mapping, created }.
+function upsertMapping(localPart, domain, destinations) {
+  localPart = String(localPart).trim().toLowerCase();
+  domain = String(domain).trim().toLowerCase();
+  const existing = store.mappings.find(
+    (m) => m.localPart === localPart && m.domain === domain);
+  if (existing) {
+    existing.destinations = destinations;
+    return { mapping: existing, created: false };
   }
-  return { domains, mappings };
+  const mapping = { id: store.nextId++, localPart, domain, destinations };
+  store.mappings.push(mapping);
+  return { mapping, created: true };
+}
+
+// Upsert by full source address (localPart@domain); used by importOrphans.
+function upsertBySource(source, destinations) {
+  const at = String(source).lastIndexOf("@");
+  upsertMapping(source.slice(0, at), source.slice(at + 1), destinations);
+}
+
+// Remove an email from every staged mapping's destinations. Mappings left with
+// no destinations are dropped from the session. Returns { updated, removed }
+// source-address lists so the caller can report what changed.
+function stripDestinationFromMappings(email) {
+  email = String(email || "").trim().toLowerCase();
+  const updated = [];
+  const removed = [];
+  for (let i = store.mappings.length - 1; i >= 0; i--) {
+    const m = store.mappings[i];
+    const kept = m.destinations.filter((e) => e.toLowerCase() !== email);
+    if (kept.length === m.destinations.length) continue;
+    if (kept.length === 0) {
+      removed.push(`${m.localPart}@${m.domain}`);
+      store.mappings.splice(i, 1);
+    } else {
+      m.destinations = kept;
+      updated.push(`${m.localPart}@${m.domain}`);
+    }
+  }
+  return { updated, removed };
+}
+
+function resetStore() {
+  store.seeded = false;
+  store.mappings = [];
+  store.nextId = 1;
+}
+
+const cloudflare = createCloudflare({
+  dataDir: DATA_DIR,
+  loadMappings,
+  upsertMapping: upsertBySource,
+  EMAIL_RE,
+  DOMAIN_RE,
+});
+
+// Seed the store from Cloudflare the first time it's needed (once per session,
+// when credentials are present). Errors leave it unseeded so it retries later.
+async function maybeSeed() {
+  if (store.seeded || !cloudflare.hasCredentials()) return;
+  try {
+    const live = await cloudflare.reconstructMappings();
+    store.mappings = [];
+    store.nextId = 1;
+    for (const m of live) upsertMapping(m.localPart, m.domain, m.destinations);
+    store.seeded = true;
+  } catch { /* not connected / transient — retry on next access */ }
+}
+
+async function getState() {
+  await maybeSeed();
+  return { mappings: store.mappings.map(publicMapping) };
 }
 
 // ---------- API handlers ----------
@@ -105,17 +158,6 @@ function cleanDestinations(input) {
   }
   if (out.length === 0) throw new ApiError(400, "At least one destination is required");
   return out;
-}
-
-function requireDomain(domainId) {
-  const row = db.prepare("SELECT id FROM domains WHERE id = ?").get(domainId);
-  if (!row) throw new ApiError(400, "Unknown domainId");
-}
-
-function setDestinations(mappingId, destinations) {
-  db.prepare("DELETE FROM destinations WHERE mapping_id = ?").run(mappingId);
-  const ins = db.prepare("INSERT INTO destinations (mapping_id, email) VALUES (?, ?)");
-  for (const e of destinations) ins.run(mappingId, e);
 }
 
 // Parse CSV text into rows of string cells. Handles quoted fields,
@@ -154,35 +196,9 @@ function parseCsv(text) {
   return rows;
 }
 
-// Get-or-create a domain by name, returning its id. Validates format.
-function ensureDomain(name, addedSet) {
-  const existing = db.prepare("SELECT id FROM domains WHERE name = ? COLLATE NOCASE").get(name);
-  if (existing) return existing.id;
-  if (!DOMAIN_RE.test(name)) throw new ApiError(400, `Invalid domain inferred from source: ${name}`);
-  const info = db.prepare("INSERT INTO domains (name) VALUES (?)").run(name);
-  if (addedSet) addedSet.add(name);
-  return Number(info.lastInsertRowid);
-}
-
-// Insert or replace a mapping (by source address), setting its destinations.
-function upsertMapping(localPart, domainId, destinations) {
-  const existing = db
-    .prepare("SELECT id FROM mappings WHERE local_part = ? AND domain_id = ?")
-    .get(localPart, domainId);
-  if (existing) {
-    setDestinations(existing.id, destinations);
-    return "updated";
-  }
-  const info = db
-    .prepare("INSERT INTO mappings (local_part, domain_id) VALUES (?, ?)")
-    .run(localPart, domainId);
-  setDestinations(Number(info.lastInsertRowid), destinations);
-  return "created";
-}
-
-// Process parsed CSV rows: infer domains from source addresses, auto-create
-// them, and upsert mappings. Runs in a single transaction — any row error
-// rolls the whole import back so the DB is never left half-updated.
+// Process parsed CSV rows: infer domains from source addresses and upsert
+// mappings into the in-memory store. Any row error aborts the whole import
+// (validation happens before any mutation), so the store is never half-updated.
 function importCsv(csvText) {
   const rows = parseCsv(csvText);
   if (rows.length === 0) throw new ApiError(400, "CSV is empty");
@@ -236,21 +252,10 @@ function importCsv(csvText) {
   if (parsed.length === 0) throw new ApiError(400, "No valid rows found in CSV");
 
   const summary = { domainsAdded: 0, created: 0, updated: 0, rows: parsed.length };
-  const addedDomains = new Set();
-  const run = db.prepare("BEGIN");
-  try {
-    run.run();
-    for (const p of parsed) {
-      const domainId = ensureDomain(p.domain, addedDomains);
-      const result = upsertMapping(p.localPart, domainId, p.destinations);
-      summary[result]++;
-    }
-    db.prepare("COMMIT").run();
-  } catch (e) {
-    try { db.prepare("ROLLBACK").run(); } catch { /* ignore */ }
-    throw e;
+  for (const p of parsed) {
+    const { created } = upsertMapping(p.localPart, p.domain, p.destinations);
+    if (created) summary.created++; else summary.updated++;
   }
-  summary.domainsAdded = addedDomains.size;
   return summary;
 }
 
@@ -271,79 +276,39 @@ const routes = [
   },
   {
     method: "POST",
-    re: /^\/api\/domains$/,
-    handler: (m, body) => {
-      const name = String(body?.name || "").trim().toLowerCase();
-      if (!DOMAIN_RE.test(name)) throw new ApiError(400, "Invalid domain name");
-      try {
-        const info = db.prepare("INSERT INTO domains (name) VALUES (?)").run(name);
-        return { id: Number(info.lastInsertRowid), name };
-      } catch (e) {
-        if (String(e.message).includes("UNIQUE")) throw new ApiError(409, "Domain already exists");
-        throw e;
-      }
-    },
-  },
-  {
-    method: "DELETE",
-    re: /^\/api\/domains\/(\d+)$/,
-    handler: (m) => {
-      const id = Number(m[1]);
-      const info = db.prepare("DELETE FROM domains WHERE id = ?").run(id);
-      if (info.changes === 0) throw new ApiError(404, "Domain not found");
-      return { ok: true };
-    },
-  },
-  {
-    method: "POST",
     re: /^\/api\/mappings$/,
-    handler: (m, body) => {
+    handler: async (m, body) => {
+      await maybeSeed();
       const localPart = String(body?.localPart || "").trim().toLowerCase();
-      const domainId = Number(body?.domainId);
+      const domain = String(body?.domain || "").trim().toLowerCase();
       if (!LOCAL_RE.test(localPart)) throw new ApiError(400, "Invalid local part");
-      if (!Number.isInteger(domainId)) throw new ApiError(400, "domainId required");
-      requireDomain(domainId);
+      if (!DOMAIN_RE.test(domain)) throw new ApiError(400, "Invalid domain");
       const destinations = cleanDestinations(body?.destinations);
-      let mappingId;
-      try {
-        const info = db
-          .prepare("INSERT INTO mappings (local_part, domain_id) VALUES (?, ?)")
-          .run(localPart, domainId);
-        mappingId = Number(info.lastInsertRowid);
-      } catch (e) {
-        if (String(e.message).includes("UNIQUE"))
-          throw new ApiError(409, "A mapping for this address already exists");
-        throw e;
-      }
-      setDestinations(mappingId, destinations);
-      return { id: mappingId };
+      const dup = store.mappings.find((x) => x.localPart === localPart && x.domain === domain);
+      if (dup) throw new ApiError(409, "A mapping for this address already exists");
+      const { mapping } = upsertMapping(localPart, domain, destinations);
+      return { id: mapping.id };
     },
   },
   {
     method: "PUT",
     re: /^\/api\/mappings\/(\d+)$/,
-    handler: (m, body) => {
+    handler: async (m, body) => {
+      await maybeSeed();
       const id = Number(m[1]);
-      const exists = db.prepare("SELECT id FROM mappings WHERE id = ?").get(id);
-      if (!exists) throw new ApiError(404, "Mapping not found");
+      const target = store.mappings.find((x) => x.id === id);
+      if (!target) throw new ApiError(404, "Mapping not found");
       const localPart = String(body?.localPart || "").trim().toLowerCase();
-      const domainId = Number(body?.domainId);
+      const domain = String(body?.domain || "").trim().toLowerCase();
       if (!LOCAL_RE.test(localPart)) throw new ApiError(400, "Invalid local part");
-      if (!Number.isInteger(domainId)) throw new ApiError(400, "domainId required");
-      requireDomain(domainId);
+      if (!DOMAIN_RE.test(domain)) throw new ApiError(400, "Invalid domain");
       const destinations = cleanDestinations(body?.destinations);
-      try {
-        db.prepare("UPDATE mappings SET local_part = ?, domain_id = ? WHERE id = ?").run(
-          localPart,
-          domainId,
-          id
-        );
-      } catch (e) {
-        if (String(e.message).includes("UNIQUE"))
-          throw new ApiError(409, "A mapping for this address already exists");
-        throw e;
-      }
-      setDestinations(id, destinations);
+      const dup = store.mappings.find(
+        (x) => x.id !== id && x.localPart === localPart && x.domain === domain);
+      if (dup) throw new ApiError(409, "A mapping for this address already exists");
+      target.localPart = localPart;
+      target.domain = domain;
+      target.destinations = destinations;
       return { id };
     },
   },
@@ -352,23 +317,36 @@ const routes = [
     re: /^\/api\/mappings\/(\d+)$/,
     handler: (m) => {
       const id = Number(m[1]);
-      const info = db.prepare("DELETE FROM mappings WHERE id = ?").run(id);
-      if (info.changes === 0) throw new ApiError(404, "Mapping not found");
+      const i = store.mappings.findIndex((x) => x.id === id);
+      if (i < 0) throw new ApiError(404, "Mapping not found");
+      store.mappings.splice(i, 1);
       return { ok: true };
     },
   },
 
   // ----- Cloudflare integration -----
   { method: "GET",    re: /^\/api\/cloudflare\/status$/,                 handler: () => cloudflare.status() },
-  { method: "POST",   re: /^\/api\/cloudflare\/token$/,                  handler: (m, b) => cloudflare.setToken(b?.token) },
-  { method: "DELETE", re: /^\/api\/cloudflare\/token$/,                  handler: () => cloudflare.clearToken() },
-  { method: "POST",   re: /^\/api\/cloudflare\/account$/,                handler: (m, b) => cloudflare.setAccount(b?.accountId) },
+  { method: "GET",    re: /^\/api\/cloudflare\/zones$/,                  handler: () => cloudflare.listZones() },
+  { method: "POST",   re: /^\/api\/cloudflare\/token$/,                  handler: async (m, b) => { const r = await cloudflare.setToken(b?.token); resetStore(); return r; } },
+  { method: "DELETE", re: /^\/api\/cloudflare\/token$/,                  handler: () => { const r = cloudflare.clearToken(); resetStore(); return r; } },
+  { method: "POST",   re: /^\/api\/cloudflare\/account$/,                handler: async (m, b) => { const r = await cloudflare.setAccount(b?.accountId); resetStore(); return r; } },
   { method: "GET",    re: /^\/api\/cloudflare\/plan$/,                   handler: () => cloudflare.plan() },
   { method: "POST",   re: /^\/api\/cloudflare\/import-orphans$/,         handler: (m, b) => cloudflare.importOrphans(b?.sources) },
   { method: "POST",   re: /^\/api\/cloudflare\/destinations\/add-missing$/, handler: () => cloudflare.addMissingDestinations() },
+  { method: "POST",   re: /^\/api\/cloudflare\/destinations\/import$/,      handler: (m, b) => cloudflare.addDestinations(b?.csv ?? b?.emails) },
   { method: "GET",    re: /^\/api\/cloudflare\/destinations$/,           handler: () => cloudflare.listDestinations() },
   { method: "POST",   re: /^\/api\/cloudflare\/destinations$/,           handler: (m, b) => cloudflare.addDestination(b?.email) },
-  { method: "DELETE", re: /^\/api\/cloudflare\/destinations\/(.+)$/,      handler: (m) => cloudflare.removeDestination(m[1]) },
+  { method: "DELETE", re: /^\/api\/cloudflare\/destinations\/(.+)$/,      handler: async (m) => {
+      await maybeSeed();
+      const email = m[1];
+      const r = await cloudflare.removeDestination(email);
+      const s = stripDestinationFromMappings(email);
+      const extra = [];
+      if (s.updated.length) extra.push(`removed from ${s.updated.length} mapping(s)`);
+      if (s.removed.length) extra.push(`deleted ${s.removed.length} now-empty mapping(s)`);
+      const note = extra.length ? `${r.note} Also ${extra.join(" and ")}.` : r.note;
+      return { ...r, mappingsUpdated: s.updated, mappingsRemoved: s.removed, note };
+    } },
   { method: "POST",   re: /^\/api\/cloudflare\/enable-routing$/,         handler: (m, b) => cloudflare.enableRouting(b?.zoneId) },
   { method: "POST",   re: /^\/api\/cloudflare\/deploy$/,                 handler: () => cloudflare.deploy() },
 ];
@@ -465,7 +443,7 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, "127.0.0.1", () => {
   const url = `http://localhost:${PORT}/`;
   console.log(`mappings UI:  ${url}`);
-  console.log(`(database ${DB_PATH})`);
+  console.log("(mappings live on Cloudflare; only the token persists in data/settings.json)");
   console.log("Ctrl+C to stop.");
   if (!process.env.NO_OPEN) {
     const cmd =
