@@ -1,0 +1,18 @@
+{
+  "name": "email-forwarding-manager-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local stdio MCP server that wraps the Email Forwarding Manager REST API.",
+  "license": "MIT",
+  "bin": {
+    "email-forwarding-manager-mcp": "server.mjs"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "zod": "^3.25.0"
+  }
+}

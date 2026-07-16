@@ -7,8 +7,8 @@ Email Routing deploy logic — but:
 
 | | Local app (repo root) | Hosted Worker (this dir) |
 |---|---|---|
-| Runtime | Node 22 (`node:sqlite`, `node:http`) | Cloudflare Workers |
-| Storage | SQLite file in `data/` | Cloudflare D1 |
+| Runtime | Node 22 (`node:http`, `node:crypto`) | Cloudflare Workers |
+| Storage | none for mappings (live from Cloudflare); token in `data/settings.json` | none for mappings (staged in a Durable Object); token in D1 |
 | UI | served by the Node server | Workers Static Assets (`../mappings`) |
 | Auth | none (localhost only) | **Cloudflare Access** at the edge |
 | API token | encrypted with a local keyfile | encrypted in D1 with a Worker secret |
@@ -30,19 +30,33 @@ Browser ──► Cloudflare Access (Google login)
               │  (only authorised users get through)
               ▼
         Worker: email-forwarding-manager
-         ├─ static UI         ← Workers Static Assets (../mappings)
-         ├─ /api/* JSON API   ← src/index.js
-         ├─ D1 (binding DB)   ← domains / mappings / destinations / settings
-         └─ Cloudflare API    ← deploys rules + the email-fanout worker
+         ├─ static UI              ← Workers Static Assets (../mappings)
+         ├─ /api/* JSON API        ← src/index.js (thin proxy)
+         ├─ /mcp remote MCP        ← src/mcp.js (Streamable HTTP via agents/mcp)
+         ├─ SessionStore (DO)      ← in-memory staged mappings, seeded from Cloudflare
+         ├─ D1 (binding DB)        ← encrypted token + selected account only
+         └─ Cloudflare API         ← reads live state; deploys rules + the email-fanout worker
 ```
 
-- `src/index.js` — fetch handler / router (the hosted equivalent of
-  `scripts/serve-mappings.mjs`).
-- `src/db.js` — async D1 data layer (domains, mappings, destinations, CSV import).
+- `src/index.js` — thin fetch handler that forwards every `/api/*` request to a
+  single `SessionStore` Durable Object, and serves the remote MCP endpoint at
+  `/mcp`.
+- `src/mcp.js` — remote MCP server (Streamable HTTP via `agents/mcp`) exposing
+  the REST API as MCP tools. Stateless: a fresh server per request; all state
+  lives in the `SessionStore` DO, which every tool calls through the same
+  `/api/*` interface, so there is no duplicated logic.
+- `src/ai-stub.js` — tiny stub aliased (in `wrangler.toml`) for the Agents SDK's
+  optional `ai` peer dependency, which its client-transport code lazily imports
+  but this Worker never runs. Keeps the bundle from pulling in the full AI SDK.
+- `src/session.js` — the `SessionStore` Durable Object: the in-memory staged
+  mapping store + all API routing (the hosted equivalent of the local app's
+  long-lived `scripts/serve-mappings.mjs` process). Mappings are reconstructed
+  from Cloudflare and staged in the DO's memory until **Deploy**; they are
+  **not** stored in a database. Domains come from the account's zones.
 - `src/cloudflare.js` — async port of the Cloudflare client; encrypts the stored
   API token with WebCrypto AES-GCM using the `ENC_KEY` secret.
-- `schema.sql` — D1 schema.
-- `wrangler.toml` — Worker + assets + D1 config.
+- `schema.sql` — D1 schema (just the `settings` table for the token).
+- `wrangler.toml` — Worker + assets + D1 + Durable Object config.
 
 There is **no auth code** in the Worker on purpose. Access control is delegated
 entirely to Cloudflare Access so that only people you authorise can reach the
@@ -52,7 +66,7 @@ app and the stored token.
 
 ## Prerequisites
 
-- A Cloudflare account with Workers, D1 and (for auth) Access available.
+- A Cloudflare account with Workers, D1, Durable Objects and (for auth) Access available.
 - [Node.js](https://nodejs.org/) 18+ and npm.
 - Wrangler is installed locally as a dev dependency (`npm install` below).
 - A Cloudflare API token for the app to use at runtime — same token the local
@@ -78,8 +92,8 @@ npm install
 npx wrangler d1 create email-forwarding-manager
 ```
 
-Copy the `database_id` it prints into `wrangler.toml`, replacing
-`REPLACE_WITH_DATABASE_ID`.
+Copy the `database_id` it prints into `wrangler.toml`, replacing the placeholder
+`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
 
 ### 3. Create the schema
 
@@ -166,6 +180,14 @@ Open the app URL, sign in through Access, then in the UI:
 > what is needed. The route binding from your custom address to the fan-out
 > worker is not fully API-managed.
 
+### 9. (Optional) Use the remote MCP endpoint
+
+Once deployed, the Worker also serves a remote **Streamable HTTP** MCP endpoint
+at `/mcp`, behind the same Cloudflare Access. Point a remote-capable MCP client
+at `https://<your-host>/mcp` and send an Access **service token** (the
+`CF-Access-Client-Id` / `CF-Access-Client-Secret` headers). See the
+[MCP server](../README.md#mcp-server) section of the root README.
+
 ---
 
 ## Day-to-day
@@ -186,13 +208,19 @@ re-running `npm run deploy` here ships the same UI the local app uses.
 ## Notes & gotchas
 
 - **D1 is separate storage.** The hosted app does not share data with the local
-  SQLite app; mappings created in one are not visible in the other. The stored
-  API token also can't be migrated between them (different encryption layout).
+  app; the stored API token can't be migrated between them (different
+  encryption layout).
 - **Token permissions** are identical to the local app — see the root README.
 - **Custom domain vs. mail.** The app's custom domain is HTTPS-only and does
   not affect the parent zone's MX / Email Routing — see step 5.
-- **Don't add `nodejs_compat`** — the Worker uses only WebCrypto, the Fetch API
-  and D1; no Node built-ins.
+- **`nodejs_compat` is required.** The remote `/mcp` endpoint uses the Agents
+  SDK (`agents/mcp`), which relies on `node:async_hooks`, so
+  `compatibility_flags = ["nodejs_compat"]` is set in `wrangler.toml`. The app's
+  own API code still uses only WebCrypto, Fetch and D1.
+- **The `ai` alias.** The Agents SDK lazily imports the Vercel AI SDK (`ai`, a
+  peer dependency) from client-transport code this Worker never runs.
+  `wrangler.toml` aliases `ai` to `src/ai-stub.js` so the bundler resolves it
+  without pulling in the full SDK.
 - **Keep the root app zero-dependency.** All Wrangler tooling lives here in
   `worker/`; nothing in this directory should leak into the repo-root
   `package.json`.

@@ -8,6 +8,7 @@ const LOCAL_RE = /^[^\s@]+$/;
 const state = {
   domains: [],
   mappings: [],
+  destinations: [], // verified Cloudflare destination emails, for the editor dropdown
 };
 
 function setStatus(el, text, kind) {
@@ -39,65 +40,29 @@ async function api(method, path, body) {
 
 async function loadState() {
   const s = await api("GET", "/api/state");
-  state.domains = s.domains;
   state.mappings = s.mappings;
-  renderDomains();
   renderMappings();
 }
 
-// ---------- Domains ----------
-
-function renderDomains() {
-  const box = $("domain-chips");
-  box.innerHTML = "";
-  if (state.domains.length === 0) {
-    box.innerHTML = `<span class="muted">No domains yet — add one below.</span>`;
-    return;
-  }
-  for (const d of state.domains) {
-    const pill = document.createElement("span");
-    pill.className = "pill";
-    pill.innerHTML = `<span class="mono">${escapeHtml(d.name)}</span>`;
-    const x = document.createElement("button");
-    x.type = "button";
-    x.textContent = "×";
-    x.title = "Remove domain";
-    x.addEventListener("click", () => onRemoveDomain(d));
-    pill.appendChild(x);
-    box.appendChild(pill);
+// Domains come from Cloudflare zones (the source of truth); loaded when
+// connected and used only to populate the mapping editor's domain picker.
+async function loadZones() {
+  try {
+    const z = await api("GET", "/api/cloudflare/zones");
+    state.domains = z.zones || [];
+  } catch {
+    state.domains = [];
   }
 }
 
-async function onAddDomain() {
-  const input = $("in-domain");
-  const name = input.value.trim().toLowerCase();
-  if (!name) return;
-  setStatus($("domain-status"), "Adding…");
+// Verified destination addresses, used to offer a dropdown in the mapping
+// editor (free text is still allowed).
+async function loadDestinations() {
   try {
-    await api("POST", "/api/domains", { name });
-    input.value = "";
-    setOk($("domain-status"), `Added ${name}.`);
-    await loadState();
-    afterDataChange();
-  } catch (e) {
-    setErr($("domain-status"), e);
-  }
-}
-
-async function onRemoveDomain(d) {
-  const used = state.mappings.filter((m) => m.domainId === d.id);
-  const msg = used.length
-    ? `Remove domain "${d.name}"? This will also delete ${used.length} mapping(s) using it.`
-    : `Remove domain "${d.name}"?`;
-  if (!confirm(msg)) return;
-  setStatus($("domain-status"), "Removing…");
-  try {
-    await api("DELETE", `/api/domains/${d.id}`);
-    setOk($("domain-status"), `Removed ${d.name}.`);
-    await loadState();
-    afterDataChange();
-  } catch (e) {
-    setErr($("domain-status"), e);
+    const d = await api("GET", "/api/cloudflare/destinations");
+    state.destinations = (d.addresses || []).filter((a) => a.verified).map((a) => a.email);
+  } catch {
+    state.destinations = [];
   }
 }
 
@@ -216,12 +181,24 @@ async function onDeleteMapping(m) {
 
 let editingId = null;
 
+// Fill the destination inputs' <datalist> with verified addresses. The inputs
+// use list="dlg-dest-options", so these appear as a dropdown while still
+// allowing free text.
+function renderDestOptions() {
+  const dl = $("dlg-dest-options");
+  if (!dl) return;
+  dl.innerHTML = (state.destinations || [])
+    .map((e) => `<option value="${escapeHtml(e)}"></option>`)
+    .join("");
+}
+
 function addDestRow(value = "") {
   const wrap = document.createElement("div");
   wrap.className = "dest-edit-row";
   const input = document.createElement("input");
   input.type = "email";
   input.placeholder = "user@example.com";
+  input.setAttribute("list", "dlg-dest-options"); // verified addresses; free text still allowed
   input.value = value;
   const rm = document.createElement("button");
   rm.type = "button";
@@ -237,22 +214,31 @@ function addDestRow(value = "") {
 }
 
 function openDialog(mapping) {
+  if (!cfConnected) {
+    setErr($("mappings-status"),
+      new Error("Connect to Cloudflare first to add or edit mappings."));
+    return;
+  }
   if (state.domains.length === 0) {
-    setErr($("mappings-status"), new Error("Add at least one domain first."));
+    setErr($("mappings-status"),
+      new Error("No Cloudflare zones found for this account — add a domain to Cloudflare first."));
     return;
   }
   editingId = mapping ? mapping.id : null;
   $("dlg-title").textContent = mapping ? "Edit mapping" : "New mapping";
   setStatus($("dlg-status"), "");
 
-  // Domain dropdown
+  // Domain dropdown, populated from the account's Cloudflare zones.
   const sel = $("dlg-domain");
   sel.innerHTML = state.domains
-    .map((d) => `<option value="${d.id}">@${escapeHtml(d.name)}</option>`)
+    .map((d) => `<option value="${escapeHtml(d.name)}">@${escapeHtml(d.name)}</option>`)
     .join("");
 
   $("dlg-local").value = mapping ? mapping.localPart : "";
-  sel.value = mapping ? mapping.domainId : state.domains[0].id;
+  sel.value = mapping ? mapping.domain : state.domains[0].name;
+
+  // Verified-address suggestions for the destination inputs' dropdown.
+  renderDestOptions();
 
   $("dlg-dests").innerHTML = "";
   const dests = mapping && mapping.destinations.length ? mapping.destinations : [""];
@@ -264,7 +250,7 @@ function openDialog(mapping) {
 
 function collectDialog() {
   const localPart = $("dlg-local").value.trim().toLowerCase();
-  const domainId = Number($("dlg-domain").value);
+  const domain = $("dlg-domain").value;
   if (!LOCAL_RE.test(localPart)) throw new Error("Enter a valid local part (no spaces or @).");
   const inputs = [...$("dlg-dests").querySelectorAll("input")];
   const seen = new Set();
@@ -278,7 +264,7 @@ function collectDialog() {
     destinations.push(e);
   }
   if (destinations.length === 0) throw new Error("Add at least one destination.");
-  return { localPart, domainId, destinations };
+  return { localPart, domain, destinations };
 }
 
 async function onDialogSave(ev) {
@@ -392,7 +378,7 @@ let cfStatusAccount = null;
 
 // ---------- Tabs ----------
 
-const TABS = ["overview", "connection", "destinations", "mappings", "guide"];
+const TABS = ["overview", "connection", "destinations", "mappings"];
 let activeTab = "overview";
 
 function switchTab(name) {
@@ -411,11 +397,6 @@ function switchTab(name) {
 // Status summary + wizard launchers shown on the Overview tab.
 function updateOverview() {
   const box = $("overview-status");
-  const deployBtn = $("btn-deploy-wizard");
-  if (deployBtn) {
-    deployBtn.disabled = !cfConnected;
-    deployBtn.title = cfConnected ? "" : "Connect to Cloudflare first";
-  }
   if (!box) return;
   if (!cfConnected) {
     box.className = "cf-banner warn";
@@ -466,9 +447,18 @@ function refreshDestinationsTab() {
 
 // Re-render every CF-status-dependent surface (no network calls).
 function renderCfStatusUi() {
+  updateGlobalDeployBtn();
   updateOverview();
   updateMappingsBanner();
   renderMappings();
+}
+
+// Enable the top-bar Deploy button only when connected.
+function updateGlobalDeployBtn() {
+  const b = $("btn-top-deploy");
+  if (!b) return;
+  b.disabled = !cfConnected;
+  b.title = cfConnected ? "" : "Connect to Cloudflare first";
 }
 
 // Like renderCfStatusUi, but also refreshes the destinations tab if it's open.
@@ -497,9 +487,30 @@ async function refreshCfConnection() {
   catch { cfConnected = false; cfStatusAccount = null; afterCfStateChange(); return; }
   cfConnected = !!(s.connected && s.tokenValid && s.account);
   cfStatusAccount = s.account || null;
-  if (!cfConnected) cfPlan = null;
+  if (!cfConnected) { cfPlan = null; state.domains = []; }
   afterCfStateChange();
-  if (cfConnected) backgroundLoadPlan(false);
+  if (cfConnected) {
+    await loadZones();
+    await loadDestinations();
+    await loadState();
+    renderMappings();
+    backgroundLoadPlan(false);
+  }
+}
+
+// Global refresh, available outside any tab: re-check the Cloudflare connection,
+// force a fresh plan, and reload the current tab's live data (e.g. the
+// destinations list, so an address verified externally shows up immediately).
+async function globalRefresh() {
+  const btn = $("btn-global-refresh");
+  if (btn) { btn.disabled = true; btn.textContent = "Refreshing…"; }
+  try {
+    cfPlan = null;                // drop cached plan so the check re-fetches
+    await refreshCfConnection();  // re-check token/account; kicks a fresh plan load
+    switchTab(activeTab);         // re-render + reload the current tab's live data
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Refresh"; }
+  }
 }
 
 // Fetch the (slow) plan in the background and refresh the table as statuses
@@ -678,7 +689,8 @@ function renderCfDestinations(d) {
     const esc = escapeHtml(email);
     item.innerHTML = `<span class="mono">${esc}</span>` +
       `<span class="row" style="gap:8px"><span class="badge pending" title="Used by a mapping but not yet a Cloudflare destination">not registered</span>` +
-      `<button data-email="${esc}" class="cf-dest-register">Send verification</button></span>`;
+      `<button data-email="${esc}" class="cf-dest-register">Send verification</button>` +
+      `<button data-email="${esc}" data-verified="0" class="cf-dest-remove danger">Remove</button></span>`;
     root.appendChild(item);
   }
   root.querySelectorAll(".cf-dest-resend").forEach((btn) => {
@@ -697,6 +709,7 @@ async function onCfDestsRefresh() {
   try {
     const d = await api("GET", "/api/cloudflare/destinations");
     renderCfDestinations(d);
+    state.destinations = (d.addresses || []).filter((a) => a.verified).map((a) => a.email);
     setStatus($("cf-dests-status"), "");
   } catch (e) {
     setErr($("cf-dests-status"), e);
@@ -721,17 +734,103 @@ async function onCfDestAdd(emailArg, btn) {
   }
 }
 
+// Bulk-add pasted/CSV email addresses to Cloudflare for verification only.
+// Uses the same two-step wizard format as the mappings CSV import. Does not
+// create or change any mappings.
+const dstwiz = { step: "input", result: null };
+
+function openDestImportWizard() {
+  if (!cfConnected) { switchTab("connection"); return; }
+  dstwiz.step = "input";
+  dstwiz.result = null;
+  $("dstwiz").showModal();
+  dstwizGo("input");
+}
+
+function dstwizGo(step) {
+  dstwiz.step = step;
+  const order = ["input", "done"];
+  for (const li of $("dstwiz-steps").children) {
+    const s = li.dataset.step;
+    li.classList.toggle("active", s === step);
+    li.classList.toggle("done", order.indexOf(s) < order.indexOf(step));
+  }
+  if (step === "input") dstwizRenderInput();
+  else dstwizRenderDone();
+}
+
+function dstwizRenderInput() {
+  const body = $("dstwiz-body");
+  body.innerHTML =
+    `<p>Paste email addresses (any separator) or upload a CSV with an ` +
+    `<code>email</code> column. This only sends Cloudflare verification ` +
+    `requests — it does <b>not</b> create or change any mappings.</p>` +
+    `<p class="muted mono" style="font-size:0.82rem">alice@gmail.com, bob@outlook.com</p>` +
+    `<div class="row"><input id="dstimp-file" type="file" accept=".csv,text/csv,text/plain" />` +
+    `<span class="muted">or paste below</span></div>` +
+    `<textarea id="dstimp-text" rows="7" placeholder="alice@gmail.com&#10;bob@outlook.com" ` +
+    `style="width:100%; margin-top:8px; font-family: var(--mono); padding:8px; border:1px solid var(--border); border-radius:6px;"></textarea>` +
+    `<div id="dstimp-status" class="status-area"></div>`;
+  $("dstimp-file").addEventListener("change", (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => { $("dstimp-text").value = String(reader.result || ""); };
+    reader.onerror = () => setErr($("dstimp-status"), new Error("Could not read file."));
+    reader.readAsText(f);
+  });
+  const next = $("dstwiz-next"), back = $("dstwiz-back"), cancel = $("dstwiz-cancel");
+  back.hidden = true; back.onclick = null;
+  next.hidden = false; next.textContent = "Add & send verification"; next.disabled = false; next.onclick = dstwizDoImport;
+  cancel.hidden = false; cancel.textContent = "Cancel"; cancel.disabled = false; cancel.onclick = () => $("dstwiz").close();
+}
+
+async function dstwizDoImport() {
+  const csv = $("dstimp-text").value;
+  if (!csv.trim()) { setErr($("dstimp-status"), new Error("Choose a file or paste addresses first.")); return; }
+  $("dstwiz-next").disabled = true;
+  setStatus($("dstimp-status"), "Adding addresses & sending verification…");
+  try {
+    dstwiz.result = await api("POST", "/api/cloudflare/destinations/import", { csv });
+    await onCfDestsRefresh();
+    if (cfConnected) backgroundLoadPlan(true);
+    dstwizGo("done");
+  } catch (e) {
+    setErr($("dstimp-status"), e);
+    $("dstwiz-next").disabled = false;
+  }
+}
+
+function dstwizRenderDone() {
+  const body = $("dstwiz-body");
+  const r = dstwiz.result || {};
+  const line = (n, label) => `<li>${(r[n] || []).length} ${label}</li>`;
+  body.innerHTML =
+    `<p><strong>Done.</strong></p><ul class="wiz-list">` +
+    line("added", "new (verification sent)") +
+    line("alreadyPending", "already pending") +
+    line("alreadyVerified", "already verified") +
+    line("invalid", "invalid") +
+    line("failed", "failed") +
+    `</ul>`;
+  const next = $("dstwiz-next"), back = $("dstwiz-back"), cancel = $("dstwiz-cancel");
+  back.hidden = false; back.textContent = "Add more"; back.onclick = () => dstwizGo("input");
+  next.hidden = false; next.textContent = "Close"; next.disabled = false; next.onclick = () => $("dstwiz").close();
+  cancel.hidden = true;
+}
+
 
 async function onCfDestRemove(email, verified, btn) {
   const warn = verified
-    ? `Remove the VERIFIED address ${email}? Any mapping forwarding to it will stop working until it is re-added and re-verified.`
-    : `Remove the pending address ${email}?`;
+    ? `Remove the VERIFIED address ${email}? It will be deleted from Cloudflare and removed from every mapping that forwards to it. Those mappings will need to be re-deployed.`
+    : `Remove ${email}? It will be removed from every mapping that forwards to it (and deleted from Cloudflare if it exists there).`;
   if (!confirm(warn)) return;
   if (btn) btn.disabled = true;
   setStatus($("cf-dests-status"), `Removing ${email}…`);
   try {
     const r = await api("DELETE", "/api/cloudflare/destinations/" + encodeURIComponent(email));
     setOk($("cf-dests-status"), r.note || "Removed.");
+    await loadState();
     await onCfDestsRefresh();
     if (cfConnected) await backgroundLoadPlan(true);
   } catch (e) {
@@ -888,8 +987,12 @@ function wizRenderValidate() {
   parts.push(`<p>Destination addresses must be verified by Cloudflare before mail can be forwarded to them.</p>`);
   parts.push(`<ul class="wiz-list">`);
   parts.push(`<li><span class="badge verified">verified</span> ${verified.length}</li>`);
-  parts.push(`<li><span class="badge pending">pending</span> ${pending.length} — recipient must click the verification email</li>`);
-  parts.push(`<li><span class="badge missing">missing</span> ${missing.length} — not yet added to Cloudflare</li>`);
+  if (pending.length) {
+    parts.push(`<li><span class="badge pending">pending</span> ${pending.length} — recipient must click the verification email</li>`);
+  }
+  if (missing.length) {
+    parts.push(`<li><span class="badge missing">missing</span> ${missing.length} — not yet added to Cloudflare</li>`);
+  }
   parts.push(`</ul>`);
   if (pending.length) {
     parts.push(`<div class="muted">Pending: ${pending.map((d) => escapeHtml(d.email)).join(", ")}</div>`);
@@ -1014,10 +1117,6 @@ function wizRenderDone() {
 // ---------- Wire up ----------
 
 document.addEventListener("DOMContentLoaded", () => {
-  $("btn-add-domain").addEventListener("click", onAddDomain);
-  $("in-domain").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); onAddDomain(); }
-  });
   $("btn-new-mapping").addEventListener("click", () => openDialog(null));
   $("dlg-add-dest").addEventListener("click", () => addDestRow());
   // Submitting the form (Enter in any field, or clicking Save) saves.
@@ -1029,6 +1128,10 @@ document.addEventListener("DOMContentLoaded", () => {
   for (const b of $("tabs").children) {
     b.addEventListener("click", () => switchTab(b.dataset.tab));
   }
+
+  // Global refresh (outside tab context)
+  $("btn-global-refresh").addEventListener("click", globalRefresh);
+  $("btn-top-deploy").addEventListener("click", openWizard);
 
   // CSV import wizard
   $("btn-import-wizard").addEventListener("click", openImportWizard);
@@ -1047,14 +1150,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Destinations
   $("dests-go-connect").addEventListener("click", () => switchTab("connection"));
-  $("btn-cf-dests-refresh").addEventListener("click", onCfDestsRefresh);
   $("btn-cf-dest-add").addEventListener("click", () => onCfDestAdd());
+  $("btn-cf-dest-import").addEventListener("click", openDestImportWizard);
+  $("dstwiz-cancel").addEventListener("click", () => $("dstwiz").close());
   $("cf-dest-email").addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); onCfDestAdd(); }
   });
 
   // Deploy wizard
-  $("btn-deploy-wizard").addEventListener("click", openWizard);
   $("wiz-cancel").addEventListener("click", wizClose);
   $("wiz").addEventListener("cancel", (e) => { if (wiz.busy) e.preventDefault(); });
 

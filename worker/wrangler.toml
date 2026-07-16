@@ -15,6 +15,16 @@
 name = "email-forwarding-manager"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
+# nodejs_compat is required by the Agents SDK (agents/mcp) used for the /mcp
+# remote MCP endpoint (it relies on node:async_hooks).
+compatibility_flags = ["nodejs_compat"]
+
+# The Agents SDK lazily imports the Vercel AI SDK ("ai") from its client
+# transport code, which this Worker never runs (we only use createMcpHandler
+# server-side with zod-defined MCP tools). Alias it to a local stub so the
+# bundler resolves the module graph without pulling in the full AI SDK.
+[alias]
+"ai" = "./src/ai-stub.js"
 
 # Custom domain. The zone (here example.com) must already be in your Cloudflare
 # account; wrangler then provisions the DNS record and TLS cert automatically.
@@ -31,12 +41,26 @@ custom_domain = true
 [assets]
 directory = "../mappings"
 
-# D1 database holding domains / mappings / destinations / settings.
+# D1 database. Holds ONLY the encrypted Cloudflare API token + selected account
+# (the `settings` table). Mappings are not stored here — they live in the
+# SessionStore Durable Object and are reconstructed from Cloudflare.
 # Replace database_id with the id printed by `wrangler d1 create`.
 [[d1_databases]]
 binding = "DB"
 database_name = "email-forwarding-manager"
-database_id = "REPLACE_WITH_DATABASE_ID"
+database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# Durable Object holding the in-memory staged mapping store for the session
+# (the stateful equivalent of the local app's long-lived process). One singleton
+# instance is used; its memory is seeded from Cloudflare and re-seeded when the
+# instance is evicted.
+[[durable_objects.bindings]]
+name = "SESSION"
+class_name = "SessionStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionStore"]
 
 # ENC_KEY (the AES-GCM key that encrypts the stored Cloudflare API token) is a
 # secret, set with `wrangler secret put ENC_KEY`, not committed here.
